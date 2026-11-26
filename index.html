@@ -7,7 +7,7 @@
 <style>
   :root{
     --bg:#0f172a; --card:#1e293b; --text:#f1f5f9; --muted:#94a3b8;
-    --accent:#3b82f6; --accent2:#10b981; --danger:#ef4444;
+    --accent:#3b82f6; --accent2:#10b981; --danger:#ef4444; --warn:#f59e0b;
   }
   *{box-sizing:border-box;margin:0;padding:0}
   html,body{height:100%;background:var(--bg);color:var(--text);
@@ -28,34 +28,41 @@
   button.btn:hover{filter:brightness(1.1)}
   button.btn.green{background:var(--accent2)}
   button.btn.red{background:var(--danger)}
+  button.btn.warn{background:var(--warn);color:#0f172a}
   button.btn.ghost{background:#334155}
   button.btn:disabled{opacity:.4;cursor:not-allowed}
   .back{position:absolute;top:16px;left:16px}
   .code{font-size:clamp(48px,11vw,110px);font-weight:800;letter-spacing:.12em;margin:12px 0;
     font-variant-numeric:tabular-nums}
-  .status{color:var(--muted);font-size:18px;margin-bottom:24px}
+  .status{color:var(--muted);font-size:18px;margin-bottom:8px}
   .status.ok{color:var(--accent2)}
+  .badge{display:inline-block;font-size:13px;padding:5px 12px;border-radius:999px;
+    background:#1e293b;color:var(--muted);margin-bottom:20px}
   .row{display:flex;gap:14px;flex-wrap:wrap;justify-content:center;margin:10px 0}
   .preview{margin-top:20px;width:min(640px,92vw);background:#000;border-radius:14px;overflow:hidden;
     display:none}
-  .preview video{width:100%;max-height:42vh;display:block;background:#000}
+  .preview video,.preview canvas{width:100%;max-height:42vh;display:block;background:#000}
   .pager{display:none;align-items:center;gap:14px;margin-top:12px}
   .pager span{min-width:90px}
   /* keypad */
   .display{font-size:clamp(40px,8vw,72px);font-weight:800;letter-spacing:.15em;min-height:1.3em;
-    background:var(--card);border-radius:18px;padding:8px 28px;margin-bottom:20px;min-width:min(420px,90vw)}
+    background:var(--card);border-radius:18px;padding:8px 28px;margin-bottom:14px;min-width:min(420px,90vw)}
+  .modeToggle{display:flex;align-items:center;gap:10px;background:var(--card);padding:10px 18px;
+    border-radius:12px;margin-bottom:16px;cursor:pointer;font-size:16px;user-select:none}
+  .modeToggle input{width:20px;height:20px;accent-color:var(--accent2);cursor:pointer}
   .keypad{display:grid;grid-template-columns:repeat(3,92px);gap:12px;margin-bottom:20px}
   .keypad button{height:78px;font-size:30px;font-weight:700;background:var(--card);color:var(--text);
     border:0;border-radius:16px;cursor:pointer}
   .keypad button:active{background:var(--accent)}
-  .err{color:#fca5a5;min-height:1.4em;margin-bottom:12px;max-width:520px}
+  .err{color:#fca5a5;min-height:1.4em;margin-bottom:12px;max-width:520px;font-size:16px}
   /* viewer */
   #viewer{padding:0;background:#000;position:fixed;inset:0;justify-content:center}
-  #remote{width:100%;height:100%;object-fit:contain;background:#000}
+  #remote,#remoteImg{width:100%;height:100%;object-fit:contain;background:#000}
+  #remoteImg{display:none}
   #waiting{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
     background:#0f172a;font-size:clamp(22px,3.5vw,40px);gap:14px;padding:24px}
-  #toolbar{position:absolute;top:0;left:0;right:0;display:flex;gap:12px;justify-content:center;padding:16px;
-    background:linear-gradient(#000a,#0000);transition:opacity .3s;z-index:10}
+  #toolbar{position:absolute;top:0;left:0;right:0;display:flex;gap:10px;flex-wrap:wrap;justify-content:center;
+    padding:16px;background:linear-gradient(#000c,#0000);transition:opacity .3s;z-index:10}
   #toolbar.hide{opacity:0;pointer-events:none}
   .viewer-hidecursor{cursor:none}
 </style>
@@ -67,8 +74,8 @@
   <h1>ClassCast</h1>
   <p class="sub">Share your screen to the classroom board</p>
   <div id="libWarn" style="display:none;background:#7f1d1d;color:#fecaca;padding:14px 20px;border-radius:12px;margin-bottom:24px;max-width:640px;font-size:16px">
-    The connection library (PeerJS) could not be loaded, so sharing can't start.
-    Check the internet connection, or ensure <b>peerjs.min.js</b> is in the same folder as <b>index.html</b>.
+    Connection libraries (PeerJS &amp; MQTT) could not be loaded.
+    Check the internet connection, or place <b>peerjs.min.js</b> and <b>mqtt.min.js</b> in the same folder as <b>index.html</b> on GitHub.
   </div>
   <div class="choices">
     <button class="big" id="btnCreate">
@@ -88,6 +95,7 @@
   <p class="sub" style="margin-bottom:0">Session code — enter this on the board</p>
   <div class="code" id="code">······</div>
   <div class="status" id="tStatus">Starting…</div>
+  <div class="badge" id="tNetInfo">Initializing channels…</div>
   <div class="row">
     <button class="btn green" id="btnScreen">🖥️ Share entire screen</button>
     <button class="btn" id="btnFile">📄 Share a file</button>
@@ -105,8 +113,12 @@
 <!-- BOARD: ENTER CODE -->
 <div id="enter" class="view">
   <button class="btn ghost back" id="enterBack">← Back</button>
-  <p class="sub" style="margin-bottom:16px">Enter the code shown on the teacher's laptop</p>
+  <p class="sub" style="margin-bottom:14px">Enter the code shown on the teacher's laptop</p>
   <div class="display" id="display"></div>
+  <label class="modeToggle">
+    <input type="checkbox" id="chkRelay">
+    <span>⚡ College Wi-Fi Mode (Firewall Bypass — Port 443)</span>
+  </label>
   <div class="err" id="err"></div>
   <div class="keypad" id="keypad"></div>
   <button class="btn green" id="btnJoin" style="font-size:24px;padding:18px 48px">Connect</button>
@@ -114,14 +126,15 @@
 
 <!-- BOARD: VIEWER -->
 <div id="viewer" class="view">
-  <!-- Muted by default so smart board browsers NEVER block autoplay -->
   <video id="remote" autoplay playsinline muted></video>
+  <img id="remoteImg" alt="Shared screen">
   <div id="waiting">
     <div style="font-size:64px">✅</div>
     <div id="waitText">Connected. Waiting for the teacher to start sharing…</div>
   </div>
   <div id="toolbar">
     <button class="btn ghost" id="btnMute">🔇 Unmute</button>
+    <button class="btn warn" id="btnSwitchRelay" style="display:none">⚡ Switch to Relay Mode</button>
     <button class="btn" id="btnFull">⛶ Full screen</button>
     <button class="btn red" id="btnLeave">Disconnect</button>
   </div>
@@ -131,126 +144,300 @@
 <script src="peerjs.min.js"></script>
 <script>window.Peer || document.write('<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"><\/script>')</script>
 <script>window.Peer || document.write('<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"><\/script>')</script>
+
+<!-- MQTT.js (for Port 443 College Wi-Fi Firewall Bypass): local first, then CDNs -->
+<script src="mqtt.min.js"></script>
+<script>window.mqtt || document.write('<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"><\/script>')</script>
+<script>window.mqtt || document.write('<script src="https://cdn.jsdelivr.net/npm/mqtt/dist/mqtt.min.js"><\/script>')</script>
+
 <!-- pdf.js (only needed for sharing PDF files) -->
 <script src="pdf.min.js"></script>
 <script>window.pdfjsLib || document.write('<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"><\/script>')</script>
-<script>
-/* =====================================================================
-   COLLEGE WI-FI FIREWALL BYPASS (TURN OVER PORT 443)
-   1. Sign up free at https://www.metered.ca/tools/openrelay/
-   2. Paste your Metered TURN Credentials API URL below:
-   ===================================================================== */
-const TURN_API_URL = 'https://YOUR_APP_NAME.metered.live/api/v1/turn/credentials?apiKey=YOUR_API_KEY';
+<script>window.pdfjsLib || document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"><\/script>')</script>
 
-const FALLBACK_ICE_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun.cloudflare.com:3478' }
+<script>
+const PREFIX = 'classcast-v1-';
+const TOPIC_BASE = 'classcast/v2/';
+// Port 443 broker listed FIRST to bypass strict college firewalls
+const MQTT_BROKERS = [
+  'wss://mqtt.eclipseprojects.io:443/mqtt',
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt'
 ];
 
-async function getPeerConfig() {
-  let iceServers = [...FALLBACK_ICE_SERVERS];
-  if (TURN_API_URL && !TURN_API_URL.includes('YOUR_APP_NAME')) {
-    try {
-      const res = await fetch(TURN_API_URL);
-      if (res.ok) {
-        const fetched = await res.json();
-        if (Array.isArray(fetched) && fetched.length > 0) {
-          iceServers = [...FALLBACK_ICE_SERVERS, ...fetched];
-        }
-      }
-    } catch (e) {
-      console.warn('Could not fetch TURN credentials, falling back to STUN:', e);
-    }
-  }
-  return {
-    debug: 1,
-    config: {
-      iceServers,
-      iceCandidatePoolSize: 10
-    }
-  };
-}
-
-const PREFIX = 'classcast-v1-';
 const $ = id => document.getElementById(id);
 
-if (!window.Peer) {
+if (!window.Peer && !window.mqtt) {
   $('libWarn').style.display = 'block';
   $('btnCreate').disabled = true;
   $('btnAccept').disabled = true;
 }
 
+/* ===== Shared State ===== */
+let role = null; // 'teacher' | 'board'
+let sessionCode = '';
 let peer = null, conn = null, call = null;
 let stream = null, fileCleanup = null;
+
+// MQTT Relay state
+let mqttClients = [];
+let activeRelayClient = null;
+let relayConnected = false;
+let relayLoopTimer = null;
+let relayVideoEl = null;
+let relayCanvas = null, relayCtx = null;
+let diffCanvas = null, diffCtx = null, lastThumb = null;
+let lastFrameTime = 0, sharpSent = false;
+let boardMode = 'direct'; // 'direct' | 'relay'
+let mediaFallbackTimer = null;
 
 function show(id) {
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
   $(id).classList.add('active');
 }
 
+function closeAllMqtt(sendEnd = false) {
+  if (sendEnd && activeRelayClient && activeRelayClient.connected && sessionCode) {
+    try { activeRelayClient.publish(TOPIC_BASE + sessionCode + '/ctrl', JSON.stringify({ type: 'end' })); } catch (e) {}
+  }
+  mqttClients.forEach(c => { try { c.end(true); } catch (e) {} });
+  mqttClients = [];
+  activeRelayClient = null;
+  relayConnected = false;
+}
+
 function resetAll() {
+  const wasTeacher = role === 'teacher';
   stopShare(false);
+  clearTimeout(mediaFallbackTimer);
+  closeAllMqtt(wasTeacher);
   try { call && call.close(); } catch (e) {}
   try { conn && conn.close(); } catch (e) {}
   try { peer && peer.destroy(); } catch (e) {}
   peer = conn = call = null;
+  role = null;
+  sessionCode = '';
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
   $('remote').srcObject = null;
+  $('remote').style.display = 'block';
+  $('remoteImg').src = '';
+  $('remoteImg').style.display = 'none';
+  $('btnSwitchRelay').style.display = 'none';
   show('home');
 }
 
+window.addEventListener('beforeunload', () => {
+  if (role === 'teacher') closeAllMqtt(true);
+});
+
 /* ======================= TEACHER ======================= */
-$('btnCreate').onclick = () => { show('teacher'); startSession(); };
+$('btnCreate').onclick = () => { role = 'teacher'; show('teacher'); startSession(); };
 $('teacherBack').onclick = resetAll;
 
 function genCode() { return String(Math.floor(100000 + Math.random() * 900000)); }
 function setStatus(t, ok) { const s = $('tStatus'); s.textContent = t; s.classList.toggle('ok', !!ok); }
 
-async function startSession() {
-  const code = genCode();
-  $('code').textContent = '······';
-  setStatus('Fetching network relays & creating session…');
-  const peerOptions = await getPeerConfig();
-  peer = new Peer(PREFIX + code, peerOptions);
-
-  peer.on('open', () => {
-    $('code').textContent = code.slice(0, 3) + ' ' + code.slice(3);
+let peerReady = false, relayReadyCount = 0;
+function updateTeacherBadge() {
+  const parts = [];
+  if (peerReady) parts.push('Direct HD ✔');
+  if (relayReadyCount > 0) parts.push('College Relay (Port 443) ✔');
+  $('tNetInfo').textContent = parts.length ? parts.join('  •  ') : 'Connecting to servers…';
+  if ((peerReady || relayReadyCount > 0) && $('code').textContent === '······') {
+    $('code').textContent = sessionCode.slice(0, 3) + ' ' + sessionCode.slice(3);
     setStatus('Waiting for the board to connect…');
-  });
+  }
+}
 
-  peer.on('error', e => {
-    if (e.type === 'unavailable-id') {
-      try { peer.destroy(); } catch (_) {}
-      startSession();
-    } else {
-      setStatus('Connection problem (' + e.type + ') — check Wi-Fi and press Back to retry.');
+function startSession() {
+  sessionCode = genCode();
+  peerReady = false;
+  relayReadyCount = 0;
+  $('code').textContent = '······';
+  setStatus('Creating session…');
+  updateTeacherBadge();
+
+  // 1. Start PeerJS (HD Direct) if available
+  if (window.Peer) {
+    peer = new Peer(PREFIX + sessionCode, {
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun.cloudflare.com:3478' }
+        ]
+      }
+    });
+    peer.on('open', () => { peerReady = true; updateTeacherBadge(); });
+    peer.on('error', e => {
+      if (e.type === 'unavailable-id') {
+        try { peer.destroy(); } catch (_) {}
+        closeAllMqtt(false);
+        startSession();
+      } else {
+        console.warn('PeerJS error (College Relay still active):', e.type);
+      }
+    });
+    peer.on('disconnected', () => { try { peer.reconnect(); } catch (e) {} });
+    peer.on('connection', c => {
+      conn = c;
+      c.on('open', () => {
+        setStatus('Board connected (HD Direct) ✔', true);
+        if (stream) callBoard();
+      });
+      c.on('close', () => {
+        if (!relayConnected) setStatus('Board disconnected. Waiting for it to connect again…');
+        conn = null;
+      });
+    });
+  }
+
+  // 2. Start MQTT Port-443 College Relay in parallel
+  if (window.mqtt) {
+    const ctrlTopic = TOPIC_BASE + sessionCode + '/ctrl';
+    MQTT_BROKERS.forEach(url => {
+      try {
+        const client = mqtt.connect(url, {
+          clientId: 'cc_t_' + Math.random().toString(16).slice(2, 10),
+          clean: true,
+          connectTimeout: 6000,
+          reconnectPeriod: 4000
+        });
+        mqttClients.push(client);
+        let counted = false;
+
+        client.on('connect', () => {
+          if (!counted) { counted = true; relayReadyCount++; updateTeacherBadge(); }
+          client.subscribe(ctrlTopic);
+        });
+
+        client.on('message', (topic, payload) => {
+          if (topic !== ctrlTopic) return;
+          let msg;
+          try { msg = JSON.parse(new TextDecoder().decode(payload)); } catch (e) { return; }
+          if (msg.type === 'join') {
+            activeRelayClient = client;
+            relayConnected = true;
+            client.publish(ctrlTopic, JSON.stringify({ type: 'hello', sharing: !!stream }));
+            setStatus('Board connected (College Wi-Fi Relay) ✔', true);
+            if (stream) {
+              lastThumb = null;
+              sharpSent = false;
+              startRelayCapture();
+            }
+          } else if (msg.type === 'leave') {
+            relayConnected = false;
+            stopRelayCapture();
+            if (!conn || !conn.open) setStatus('Board disconnected. Waiting for it to connect again…');
+          }
+        });
+      } catch (e) {
+        console.warn('MQTT init error for', url, e);
+      }
+    });
+  }
+
+  setTimeout(() => {
+    if ($('code').textContent === '······') {
+      setStatus('Could not reach servers — check internet and press Back to retry.');
     }
-  });
-
-  peer.on('disconnected', () => {
-    setStatus('Signaling dropped, reconnecting…');
-    try { peer.reconnect(); } catch (e) {}
-  });
-
-  peer.on('connection', c => {
-    conn = c;
-    c.on('open', () => {
-      setStatus('Board connected ✔', true);
-      if (stream) callBoard();
-    });
-    c.on('close', () => {
-      setStatus('Board disconnected. Waiting for it to connect again…');
-      conn = null;
-    });
-  });
+  }, 9000);
 }
 
 function callBoard() {
-  if (!conn || !stream) return;
+  if (!conn || !conn.open || !stream) return;
   try { call && call.close(); } catch (e) {}
+  conn.send({ type: 'sharing' });
   call = peer.call(conn.peer, stream);
-  call.on('error', e => setStatus('Stream error: ' + e.message));
+}
+
+/* ===== Teacher Relay Frame Capture (JPEG over WSS) ===== */
+function stopRelayCapture() {
+  if (relayLoopTimer) { clearTimeout(relayLoopTimer); relayLoopTimer = null; }
+  if (relayVideoEl) { relayVideoEl.pause(); relayVideoEl.srcObject = null; relayVideoEl = null; }
+  lastThumb = null;
+  sharpSent = false;
+}
+
+function startRelayCapture() {
+  stopRelayCapture();
+  if (!stream || !relayConnected || !activeRelayClient) return;
+
+  relayVideoEl = document.createElement('video');
+  relayVideoEl.muted = true;
+  relayVideoEl.playsInline = true;
+  relayVideoEl.srcObject = stream;
+  relayVideoEl.play().catch(() => {});
+
+  if (!relayCanvas) {
+    relayCanvas = document.createElement('canvas');
+    relayCtx = relayCanvas.getContext('2d', { willReadFrequently: false });
+    diffCanvas = document.createElement('canvas');
+    diffCanvas.width = 32; diffCanvas.height = 18;
+    diffCtx = diffCanvas.getContext('2d', { willReadFrequently: true });
+  }
+
+  const frameTopic = TOPIC_BASE + sessionCode + '/frame';
+
+  function sendFrame(highRes) {
+    if (!relayVideoEl || relayVideoEl.readyState < 2 || !activeRelayClient || !activeRelayClient.connected) return;
+    const vw = relayVideoEl.videoWidth || 1280;
+    const vh = relayVideoEl.videoHeight || 720;
+    const maxW = highRes ? 1600 : 1152;
+    const scale = Math.min(1, maxW / vw);
+    const w = Math.round(vw * scale);
+    const h = Math.round(vh * scale);
+
+    if (relayCanvas.width !== w || relayCanvas.height !== h) {
+      relayCanvas.width = w; relayCanvas.height = h;
+    }
+    relayCtx.drawImage(relayVideoEl, 0, 0, w, h);
+
+    let quality = highRes ? 0.76 : 0.56;
+    let dataUrl = relayCanvas.toDataURL('image/jpeg', quality);
+    // Keep payload fast & under public broker packet limits
+    if (dataUrl.length > 170000) dataUrl = relayCanvas.toDataURL('image/jpeg', 0.42);
+    if (dataUrl.length > 220000) dataUrl = relayCanvas.toDataURL('image/jpeg', 0.30);
+
+    activeRelayClient.publish(frameTopic, dataUrl, { qos: 0 });
+    lastFrameTime = Date.now();
+  }
+
+  function hasChanged() {
+    if (!relayVideoEl || relayVideoEl.readyState < 2) return false;
+    diffCtx.drawImage(relayVideoEl, 0, 0, 32, 18);
+    const cur = diffCtx.getImageData(0, 0, 32, 18).data;
+    if (!lastThumb) { lastThumb = new Uint8ClampedArray(cur); return true; }
+    let diff = 0;
+    for (let i = 0; i < cur.length; i += 4) {
+      diff += Math.abs(cur[i] - lastThumb[i]) + Math.abs(cur[i+1] - lastThumb[i+1]) + Math.abs(cur[i+2] - lastThumb[i+2]);
+    }
+    const avg = diff / (32 * 18 * 3);
+    if (avg > 1.8) {
+      lastThumb.set(cur);
+      return true;
+    }
+    return false;
+  }
+
+  function tick() {
+    if (!stream || !relayConnected) return;
+    const now = Date.now();
+    if (hasChanged()) {
+      sharpSent = false;
+      sendFrame(false);
+    } else if (!sharpSent && now - lastFrameTime > 600) {
+      // Screen settled: send one crisp frame for sharp slide/code text
+      sharpSent = true;
+      sendFrame(true);
+    } else if (now - lastFrameTime > 4500) {
+      // Periodic refresh in case board missed a frame
+      sendFrame(true);
+    }
+    relayLoopTimer = setTimeout(tick, 240);
+  }
+
+  relayLoopTimer = setTimeout(tick, 150);
 }
 
 function setStream(s) {
@@ -258,9 +445,11 @@ function setStream(s) {
   stream = s;
   $('btnStop').disabled = false;
   callBoard();
+  if (relayConnected) startRelayCapture();
 }
 
 function stopShare(notify = true) {
+  stopRelayCapture();
   if (fileCleanup) { fileCleanup(); fileCleanup = null; }
   if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
   try { call && call.close(); } catch (e) {}
@@ -269,7 +458,12 @@ function stopShare(notify = true) {
   $('preview').innerHTML = '';
   $('pager').style.display = 'none';
   $('btnStop').disabled = true;
-  if (notify && conn && conn.open) conn.send({ type: 'stopped' });
+  if (notify) {
+    if (conn && conn.open) conn.send({ type: 'stopped' });
+    if (activeRelayClient && activeRelayClient.connected && sessionCode) {
+      activeRelayClient.publish(TOPIC_BASE + sessionCode + '/ctrl', JSON.stringify({ type: 'stopped' }));
+    }
+  }
 }
 $('btnStop').onclick = () => stopShare(true);
 
@@ -330,7 +524,6 @@ async function shareImage(f) {
   const timer = setInterval(draw, 500);
   setStream(c.captureStream(15));
   fileCleanup = () => { clearInterval(timer); URL.revokeObjectURL(url); };
-  c.style.cssText = 'width:100%;display:block';
   showPreview(c);
 }
 
@@ -352,6 +545,7 @@ async function sharePDF(f) {
     pageCanvas = pc; pageNum = n;
     $('pageInfo').textContent = 'Page ' + n + ' / ' + pdf.numPages;
     draw();
+    lastThumb = null; sharpSent = false; // Force instant update on board
   }
   const draw = () => { if (pageCanvas) drawContain(ctx, c, pageCanvas, pageCanvas.width, pageCanvas.height); };
   await render(1);
@@ -361,7 +555,6 @@ async function sharePDF(f) {
   $('prevPage').onclick = () => { if (pageNum > 1) render(pageNum - 1); };
   $('nextPage').onclick = () => { if (pageNum < pdf.numPages) render(pageNum + 1); };
   fileCleanup = () => { clearInterval(timer); pdf.destroy(); };
-  c.style.cssText = 'width:100%;display:block';
   showPreview(c);
 }
 
@@ -379,7 +572,13 @@ async function shareVideo(f) {
 
 /* ======================= BOARD: ENTER CODE ======================= */
 let entered = '';
-$('btnAccept').onclick = () => { entered = ''; updateDisplay(); $('err').textContent = ''; show('enter'); };
+$('btnAccept').onclick = () => {
+  role = 'board';
+  entered = '';
+  updateDisplay();
+  $('err').textContent = '';
+  show('enter');
+};
 $('enterBack').onclick = resetAll;
 
 (function buildKeypad() {
@@ -408,75 +607,223 @@ document.addEventListener('keydown', ev => {
 $('btnJoin').onclick = join;
 
 /* ======================= BOARD: JOIN + VIEW ======================= */
-async function join() {
+function join() {
   if (entered.length !== 6) { $('err').textContent = 'Please enter all 6 digits.'; return; }
-  $('err').textContent = 'Fetching relays & connecting…';
+  sessionCode = entered;
   try { peer && peer.destroy(); } catch (e) {}
+  closeAllMqtt(false);
 
-  const peerOptions = await getPeerConfig();
-  peer = new Peer(undefined, peerOptions);
+  const forceRelay = $('chkRelay').checked || !window.Peer;
+  if (forceRelay) {
+    joinViaRelay();
+  } else {
+    joinViaDirectFirst();
+  }
+}
 
-  let opened = false;
-  const fail = msg => { $('err').textContent = msg; try { peer.destroy(); } catch (e) {} };
-  const timeout = setTimeout(() => {
-    if (!opened) fail('Timed out. College firewall may be blocking WebRTC — verify your TURN_API_URL is set.');
-  }, 15000);
+function joinViaDirectFirst() {
+  $('err').textContent = 'Trying Direct HD connection…';
+  boardMode = 'direct';
+  let opened = false, fellBack = false;
+
+  const switchToRelay = reason => {
+    if (opened || fellBack) return;
+    fellBack = true;
+    clearTimeout(directTimeout);
+    try { peer && peer.destroy(); } catch (e) {}
+    peer = conn = null;
+    if (window.mqtt) {
+      $('err').textContent = reason + ' Switching to College Wi-Fi Relay (Port 443)…';
+      joinViaRelay();
+    } else {
+      $('err').textContent = 'Direct connection blocked and MQTT library unavailable.';
+    }
+  };
+
+  const directTimeout = setTimeout(() => switchToRelay('Firewall detected.'), 5500);
+
+  peer = new Peer(undefined, {
+    config: {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun.cloudflare.com:3478' }
+      ]
+    }
+  });
 
   peer.on('open', () => {
-    $('err').textContent = 'Signaling OK. Establishing P2P/Relay tunnel…';
-    conn = peer.connect(PREFIX + entered, { reliable: true });
-
+    conn = peer.connect(PREFIX + sessionCode, { reliable: true });
     conn.on('iceStateChanged', state => {
-      if (state === 'failed' && !opened) {
-        clearTimeout(timeout);
-        fail('Firewall blocked direct connection (ICE failed). Add a Port-443 TURN key.');
-      }
+      if (state === 'failed') switchToRelay('Direct P2P blocked.');
     });
-
     conn.on('open', () => {
-      opened = true; clearTimeout(timeout);
+      if (fellBack) return;
+      opened = true;
+      clearTimeout(directTimeout);
       $('err').textContent = '';
-      enterViewer();
+      enterViewer('direct');
     });
-
     conn.on('data', d => {
-      if (d && d.type === 'stopped') {
-        $('waitText').textContent = 'Connected. Waiting for the teacher to start sharing…';
+      if (!d) return;
+      if (d.type === 'stopped') {
+        clearTimeout(mediaFallbackTimer);
+        $('waitText').textContent = 'Connected (HD). Waiting for the teacher to start sharing…';
         $('waiting').style.display = 'flex';
+      } else if (d.type === 'sharing' && boardMode === 'direct') {
+        // If firewall allows DataChannel but blocks video stream, auto-switch to Relay
+        clearTimeout(mediaFallbackTimer);
+        mediaFallbackTimer = setTimeout(() => {
+          if (boardMode === 'direct' && $('waiting').style.display !== 'none' && window.mqtt) {
+            upgradeViewerToRelay();
+          }
+        }, 5000);
       }
     });
-
     conn.on('close', () => {
-      if (opened) { alert('The teacher ended the session.'); resetAll(); }
+      if (opened && boardMode === 'direct') { alert('The teacher ended the session.'); resetAll(); }
     });
   });
 
   peer.on('call', c => {
     c.answer();
     c.on('stream', s => {
+      clearTimeout(mediaFallbackTimer);
+      if (boardMode !== 'direct') return;
       const v = $('remote');
       v.srcObject = s;
-      v.muted = true; // Guarantee autoplay works on smart boards
+      v.muted = true;
       $('btnMute').textContent = '🔇 Unmute';
-      v.play().catch(err => console.warn('Autoplay warning:', err));
+      v.style.display = 'block';
+      $('remoteImg').style.display = 'none';
+      v.play().catch(() => {});
       $('waiting').style.display = 'none';
     });
   });
 
   peer.on('error', e => {
-    clearTimeout(timeout);
-    if (e.type === 'peer-unavailable') fail('Session not found. Check the 6-digit code.');
-    else if (!opened) fail('Connection error (' + e.type + '). Check internet/firewall.');
+    if (!opened) switchToRelay('Direct channel unavailable (' + e.type + ').');
+  });
+}
+
+function upgradeViewerToRelay() {
+  boardMode = 'relay';
+  try { call && call.close(); } catch (e) {}
+  try { conn && conn.close(); } catch (e) {}
+  try { peer && peer.destroy(); } catch (e) {}
+  peer = conn = call = null;
+  $('waitText').textContent = 'Switching to College Wi-Fi Relay (Port 443)…';
+  $('waiting').style.display = 'flex';
+  $('btnSwitchRelay').style.display = 'none';
+  $('btnMute').style.display = 'none';
+  joinViaRelay(true);
+}
+
+$('btnSwitchRelay').onclick = e => {
+  e.stopPropagation();
+  upgradeViewerToRelay();
+};
+
+function joinViaRelay(alreadyInViewer = false) {
+  if (!window.mqtt) { $('err').textContent = 'Relay library (MQTT) not loaded.'; return; }
+  boardMode = 'relay';
+  if (!alreadyInViewer) $('err').textContent = 'Connecting via College Wi-Fi Relay (Port 443)…';
+
+  const ctrlTopic = TOPIC_BASE + sessionCode + '/ctrl';
+  const frameTopic = TOPIC_BASE + sessionCode + '/frame';
+  let joined = false;
+  let connectedBrokers = 0;
+
+  const relayTimeout = setTimeout(() => {
+    if (joined) return;
+    closeAllMqtt(false);
+    const msg = connectedBrokers > 0
+      ? 'Session not found. Check the 6-digit code.'
+      : 'Could not reach relay servers. Check internet connection.';
+    if (alreadyInViewer) { alert(msg); resetAll(); }
+    else $('err').textContent = msg;
+  }, 8500);
+
+  MQTT_BROKERS.forEach(url => {
+    try {
+      const client = mqtt.connect(url, {
+        clientId: 'cc_b_' + Math.random().toString(16).slice(2, 10),
+        clean: true,
+        connectTimeout: 6000,
+        reconnectPeriod: 3000
+      });
+      mqttClients.push(client);
+
+      client.on('connect', () => {
+        if (joined && client !== activeRelayClient) { client.end(true); return; }
+        connectedBrokers++;
+        client.subscribe([ctrlTopic, frameTopic], () => {
+          client.publish(ctrlTopic, JSON.stringify({ type: 'join' }));
+        });
+      });
+
+      client.on('message', (topic, payload) => {
+        if (topic === ctrlTopic) {
+          let msg;
+          try { msg = JSON.parse(new TextDecoder().decode(payload)); } catch (e) { return; }
+          if (msg.type === 'hello' && !joined) {
+            joined = true;
+            clearTimeout(relayTimeout);
+            activeRelayClient = client;
+            // Close other backup broker connections
+            mqttClients.forEach(c => { if (c !== client) { try { c.end(true); } catch (e) {} } });
+            mqttClients = [client];
+            $('err').textContent = '';
+            enterViewer('relay');
+          } else if (msg.type === 'stopped' && client === activeRelayClient) {
+            $('waitText').textContent = 'Connected (College Relay). Waiting for the teacher to start sharing…';
+            $('waiting').style.display = 'flex';
+          } else if (msg.type === 'end' && client === activeRelayClient) {
+            alert('The teacher ended the session.');
+            resetAll();
+          }
+        } else if (topic === frameTopic) {
+          if (!joined) {
+            joined = true;
+            clearTimeout(relayTimeout);
+            activeRelayClient = client;
+            mqttClients.forEach(c => { if (c !== client) { try { c.end(true); } catch (e) {} } });
+            mqttClients = [client];
+            enterViewer('relay');
+          }
+          if (client !== activeRelayClient) return;
+          const dataUrl = new TextDecoder().decode(payload);
+          if (dataUrl.startsWith('data:image/')) {
+            $('remote').style.display = 'none';
+            $('remoteImg').style.display = 'block';
+            $('remoteImg').src = dataUrl;
+            $('waiting').style.display = 'none';
+          }
+        }
+      });
+    } catch (e) {
+      console.warn('MQTT board error:', url, e);
+    }
   });
 }
 
 let hideTimer = null;
-function enterViewer() {
+function enterViewer(mode) {
   show('viewer');
   $('waiting').style.display = 'flex';
+  if (mode === 'relay') {
+    $('waitText').textContent = 'Connected (College Wi-Fi Relay). Waiting for the teacher to start sharing…';
+    $('btnMute').style.display = 'none';
+    $('btnSwitchRelay').style.display = 'none';
+  } else {
+    $('waitText').textContent = 'Connected (HD Direct). Waiting for the teacher to start sharing…';
+    $('btnMute').style.display = 'inline-block';
+    $('btnSwitchRelay').style.display = window.mqtt ? 'inline-block' : 'none';
+  }
   showToolbar();
   try { navigator.wakeLock && navigator.wakeLock.request('screen').catch(() => {}); } catch (e) {}
 }
+
 function showToolbar() {
   $('toolbar').classList.remove('hide');
   $('viewer').classList.remove('viewer-hidecursor');
@@ -505,7 +852,14 @@ $('btnFull').onclick = e => {
   else document.documentElement.requestFullscreen().catch(() => alert('Full screen is not allowed by this browser.'));
 };
 document.addEventListener('fullscreenchange', updateFullBtn);
-$('btnLeave').onclick = e => { e.stopPropagation(); resetAll(); };
+
+$('btnLeave').onclick = e => {
+  e.stopPropagation();
+  if (activeRelayClient && activeRelayClient.connected && sessionCode) {
+    try { activeRelayClient.publish(TOPIC_BASE + sessionCode + '/ctrl', JSON.stringify({ type: 'leave' })); } catch (_) {}
+  }
+  resetAll();
+};
 </script>
 </body>
 </html>
