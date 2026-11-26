@@ -32,6 +32,7 @@
   button.btn.ghost{background:#334155}
   button.btn:disabled{opacity:.4;cursor:not-allowed}
   .back{position:absolute;top:16px;left:16px}
+  .verTag{position:fixed;bottom:10px;right:14px;font-size:12px;color:#475569;pointer-events:none;z-index:2}
   .code{font-size:clamp(48px,11vw,110px);font-weight:800;letter-spacing:.12em;margin:12px 0;
     font-variant-numeric:tabular-nums}
   .status{color:var(--muted);font-size:18px;margin-bottom:8px}
@@ -59,6 +60,7 @@
     border:0;border-radius:16px;cursor:pointer}
   .keypad button:active{background:var(--accent)}
   .err{color:#fca5a5;min-height:1.4em;margin-bottom:12px;max-width:560px;font-size:15px;line-height:1.4}
+  .err.info{color:#93c5fd}
   /* viewer */
   #viewer{padding:0;background:#000;position:fixed;inset:0;justify-content:center}
   #remote,#remoteCanvas{width:100%;height:100%;object-fit:contain;background:#000}
@@ -72,6 +74,8 @@
 </style>
 </head>
 <body>
+
+<div class="verTag">ClassCast v6</div>
 
 <!-- HOME -->
 <div id="home" class="view active">
@@ -101,7 +105,6 @@
   <div class="status" id="tStatus">Starting…</div>
   <div class="badge" id="tNetInfo">Initializing channels…</div>
 
-  <!-- Relay Bitrate / Quality Selector -->
   <div class="presets" id="presetBar" title="Controls Relay stream bitrate & smoothness">
     <button class="preset active" data-mode="auto">⚡ Balanced (900 kbps)</button>
     <button class="preset" data-mode="fast">🚀 Ultra-Fast (500 kbps)</button>
@@ -129,7 +132,7 @@
   <div class="display" id="display"></div>
   <label class="modeToggle">
     <input type="checkbox" id="chkRelay" checked>
-    <span>⚡ College Wi-Fi Mode (Firewall Bypass — Port 443)</span>
+    <span>⚡ College Wi-Fi Mode (Firewall Bypass)</span>
   </label>
   <div class="err" id="err"></div>
   <div class="keypad" id="keypad"></div>
@@ -146,39 +149,40 @@
   </div>
   <div id="toolbar">
     <button class="btn ghost" id="btnMute">🔇 Unmute</button>
-    <button class="btn warn" id="btnSwitchRelay" style="display:none">⚡ Switch to Relay Mode</button>
+    <button class="btn warn" id="btnSwitchRelay" style="display:none">⚡ Switch to Relay</button>
+    <button class="btn ghost" id="btnCompatFrames" style="display:none">🖼️ Compat Mode</button>
     <button class="btn" id="btnFull">⛶ Full screen</button>
     <button class="btn red" id="btnLeave">Disconnect</button>
   </div>
 </div>
 
-<!-- PeerJS: local copy first, then CDN fallbacks -->
+<!-- PeerJS -->
 <script src="peerjs.min.js"></script>
 <script>window.Peer || document.write('<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"><\/script>')</script>
 <script>window.Peer || document.write('<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"><\/script>')</script>
 
-<!-- MQTT.js 5.x: native binary Uint8Array support in browser -->
+<!-- MQTT.js 5.x -->
 <script src="mqtt.min.js"></script>
 <script>window.mqtt || document.write('<script src="https://unpkg.com/mqtt@5.14.1/dist/mqtt.min.js"><\/script>')</script>
 <script>window.mqtt || document.write('<script src="https://cdn.jsdelivr.net/npm/mqtt@5.14.1/dist/mqtt.min.js"><\/script>')</script>
 
-<!-- pdf.js (only needed for sharing PDF files) -->
+<!-- pdf.js -->
 <script src="pdf.min.js"></script>
 <script>window.pdfjsLib || document.write('<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"><\/script>')</script>
 <script>window.pdfjsLib || document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"><\/script>')</script>
 
 <script>
 const PREFIX = 'classcast-v1-';
-const TOPIC_BASE = 'classcast/v5/';
+const TOPIC_BASE = 'classcast/live/'; // Permanent channel name
 
+// Fastest & most reliable public WSS brokers first
 const MQTT_BROKERS = [
-  { name: 'Eclipse-443', url: 'wss://mqtt.eclipseprojects.io:443/mqtt' },
-  { name: 'EMQX-8084',   url: 'wss://broker.emqx.io:8084/mqtt' },
-  { name: 'HiveMQ-8884', url: 'wss://broker.hivemq.com:8884/mqtt' },
-  { name: 'Mosq-8081',   url: 'wss://test.mosquitto.org:8081' }
+  { name: 'EMQX',    url: 'wss://broker.emqx.io:8084/mqtt' },
+  { name: 'HiveMQ',  url: 'wss://broker.hivemq.com:8884/mqtt' },
+  { name: 'Mosq',    url: 'wss://test.mosquitto.org:8081' },
+  { name: 'Eclipse', url: 'wss://mqtt.eclipseprojects.io:443/mqtt' }
 ];
 
-// Candidate codecs for live 25–30 FPS MediaRecorder -> MSE streaming
 const VIDEO_AUDIO_CODECS = [
   'video/webm;codecs=vp8,opus',
   'video/webm;codecs=vp9,opus',
@@ -220,7 +224,7 @@ if (!window.Peer && !window.mqtt) {
 }
 
 /* ===== Shared State ===== */
-let role = null; // 'teacher' | 'board'
+let role = null;
 let sessionCode = '';
 let peer = null, conn = null, call = null;
 let stream = null, fileCleanup = null;
@@ -228,20 +232,21 @@ let stream = null, fileCleanup = null;
 // MQTT Relay state
 let mqttEntries = []; // { name, client }
 let activeRelayEntry = null;
+let activeBoardId = null;
 let relayConnected = false;
 let boardCaps = { webp: false, mse: [] };
 let forceImgFallback = false;
-let relayPreset = 'auto'; // 'auto' | 'fast' | 'sharp'
+let relayPreset = 'auto';
 let joinRetryTimer = null;
 
-// Teacher MSE MediaRecorder state (primary — 25-30 FPS smooth video!)
+// Teacher MSE MediaRecorder state
 let mediaRecorder = null;
 let streamGen = 0;
 let chunkSendChain = Promise.resolve();
 let bytesThisSec = 0, lastRateTick = 0, liveKbps = 0;
 let activeStreamMode = ''; // 'MSE' | 'IMG'
 
-// Teacher Fallback Image-Frame state (only if smart board lacks MSE)
+// Teacher Fallback Image-Frame state
 let relayLoopTimer = null;
 let relayVideoEl = null;
 let relayCanvas = null, relayCtx = null;
@@ -249,12 +254,14 @@ let diffCanvas = null, diffCtx = null, lastThumb = null;
 let lastFrameTime = 0, sharpSent = false, isEncoding = false;
 
 // Board MSE playback state
-let boardMode = 'relay'; // 'direct' | 'relay'
+let boardMode = 'relay';
 let mediaFallbackTimer = null;
 let mseSource = null, mseUrl = null, mseBuffer = null;
 let mseQueue = [];
 let activeMseGen = -1;
 let mseSyncTimer = null;
+let mseWatchdog = null;
+let mseChunksSeen = 0;
 
 // Board Fallback Canvas state
 let boardDecoding = false;
@@ -265,11 +272,18 @@ function show(id) {
   $(id).classList.add('active');
 }
 
+function setBoardMsg(text, isInfo = false) {
+  const el = $('err');
+  el.textContent = text;
+  el.classList.toggle('info', !!isInfo);
+}
+
 function teardownBoardMse() {
-  clearInterval(mseSyncTimer);
-  mseSyncTimer = null;
+  clearInterval(mseSyncTimer); mseSyncTimer = null;
+  clearTimeout(mseWatchdog); mseWatchdog = null;
   mseQueue = [];
   activeMseGen = -1;
+  mseChunksSeen = 0;
   if (mseBuffer) {
     try { mseBuffer.onupdateend = null; mseBuffer.onerror = null; } catch (e) {}
     mseBuffer = null;
@@ -301,6 +315,7 @@ function closeAllMqtt(sendEnd = false) {
   mqttEntries.forEach(({ client }) => { try { client.end(true); } catch (e) {} });
   mqttEntries = [];
   activeRelayEntry = null;
+  activeBoardId = null;
   relayConnected = false;
 }
 
@@ -323,6 +338,7 @@ function resetAll() {
   $('remote').style.display = 'block';
   $('remoteCanvas').style.display = 'none';
   $('btnSwitchRelay').style.display = 'none';
+  $('btnCompatFrames').style.display = 'none';
   show('home');
 }
 
@@ -351,7 +367,7 @@ let peerReady = false;
 let connectedBrokerNames = new Set();
 
 function updateTeacherBadge() {
-  if (relayConnected && stream) {
+  if (relayConnected && stream && activeRelayEntry) {
     const label = activeStreamMode === 'MSE' ? 'Live Video (25–30 FPS)' : 'Compat Frames';
     $('tNetInfo').textContent =
       `Relay (${activeRelayEntry.name}) • ${label} • ${liveKbps} kbps`;
@@ -413,7 +429,7 @@ function startSession() {
     });
   }
 
-  // 2. MQTT Relay (Port 443 primary)
+  // 2. MQTT Relay (2-step hello -> confirm prevents broker mismatch!)
   if (window.mqtt) {
     const toHostTopic  = TOPIC_BASE + sessionCode + '/to-host';
     const toBoardTopic = TOPIC_BASE + sessionCode + '/to-board';
@@ -444,23 +460,32 @@ function startSession() {
           try { msg = JSON.parse(decodePayload(payload)); } catch (e) { return; }
 
           if (msg.type === 'join') {
+            // Reply 'hello' on THIS broker; wait for board's 'confirm' to lock the winning broker
+            client.publish(toBoardTopic, JSON.stringify({
+              type: 'hello',
+              boardId: msg.boardId,
+              broker: broker.name,
+              sharing: !!stream
+            }));
+          } else if (msg.type === 'confirm') {
+            // Board locked onto THIS exact broker — now teacher locks onto it too
+            if (activeBoardId === msg.boardId && activeRelayEntry === entry && relayConnected) return;
+            activeBoardId = msg.boardId;
             activeRelayEntry = entry;
             relayConnected = true;
             boardCaps = { webp: !!msg.webp, mse: Array.isArray(msg.mse) ? msg.mse : [] };
             forceImgFallback = false;
-            client.publish(toBoardTopic, JSON.stringify({ type: 'hello', sharing: !!stream }));
             setStatus('Board connected (' + broker.name + ' Relay) ✔', true);
             updateTeacherBadge();
             if (stream) startRelayStream();
-          } else if (msg.type === 'need-reset') {
-            // Board requested a fresh keyframe/init segment
+          } else if (msg.type === 'need-reset' && entry === activeRelayEntry) {
             if (stream && relayConnected) startRelayStream();
-          } else if (msg.type === 'fallback-img') {
-            // Smart board MSE errored — switch cleanly to image frames
+          } else if (msg.type === 'fallback-img' && entry === activeRelayEntry) {
             forceImgFallback = true;
             if (stream && relayConnected) startRelayStream();
-          } else if (msg.type === 'leave') {
+          } else if (msg.type === 'leave' && entry === activeRelayEntry) {
             relayConnected = false;
+            activeBoardId = null;
             stopRelayStream();
             updateTeacherBadge();
             if (!conn || !conn.open) setStatus('Board disconnected. Waiting for it to connect again…');
@@ -511,7 +536,6 @@ function pickSharedVideoCodec(hasAudio) {
   for (const mime of list) {
     if (boardCaps.mse.includes(mime) && MediaRecorder.isTypeSupported(mime)) return mime;
   }
-  // If audio codec mismatch, try video-only so video still streams smoothly
   if (hasAudio) {
     for (const mime of VIDEO_ONLY_CODECS) {
       if (boardCaps.mse.includes(mime) && MediaRecorder.isTypeSupported(mime)) return mime;
@@ -527,11 +551,8 @@ function startRelayStream() {
   const hasAudio = stream.getAudioTracks().length > 0;
   const chosenMime = pickSharedVideoCodec(hasAudio);
 
-  if (chosenMime) {
-    startMseRelay(chosenMime, hasAudio);
-  } else {
-    startImageFallbackRelay();
-  }
+  if (chosenMime) startMseRelay(chosenMime, hasAudio);
+  else startImageFallbackRelay();
 }
 
 function startMseRelay(mime, hasAudio) {
@@ -543,7 +564,6 @@ function startMseRelay(mime, hasAudio) {
   const myGen = streamGen;
   const frameTopic = TOPIC_BASE + sessionCode + '/frame';
 
-  // Build stream matching codec (strip audio track if using a video-only codec)
   const includeAudio = hasAudio && mime.includes('opus');
   const recordStream = includeAudio
     ? stream
@@ -553,7 +573,6 @@ function startMseRelay(mime, hasAudio) {
     relayPreset === 'fast'  ? 500000 :
     relayPreset === 'sharp' ? 1600000 : 900000;
 
-  // Send MSE Stream Start packet (0x04) on the SAME topic so strict FIFO order is guaranteed
   const metaBytes = encoder.encode(JSON.stringify({ mime, audio: includeAudio }));
   const initPkt = new Uint8Array(metaBytes.length + 2);
   initPkt[0] = 4;
@@ -568,7 +587,6 @@ function startMseRelay(mime, hasAudio) {
       audioBitsPerSecond: includeAudio ? 48000 : undefined
     });
   } catch (e) {
-    console.warn('MediaRecorder failed, falling back to image frames:', e);
     forceImgFallback = true;
     startImageFallbackRelay();
     return;
@@ -581,13 +599,11 @@ function startMseRelay(mime, hasAudio) {
   mediaRecorder.ondataavailable = e => {
     if (!e.data || e.data.size === 0) return;
     const blob = e.data;
-    // Chain promises so chunks are ALWAYS published in exact sequence
     chunkSendChain = chunkSendChain.then(async () => {
       if (myGen !== streamGen || !relayConnected || !activeRelayEntry || !activeRelayEntry.client.connected) return;
-      const ab = await blob.arrayBuffer();
-      const bytes = new Uint8Array(ab);
+      const bytes = new Uint8Array(await blob.arrayBuffer());
       const pkt = new Uint8Array(bytes.length + 2);
-      pkt[0] = 3; // MSE binary video chunk
+      pkt[0] = 3;
       pkt[1] = myGen;
       pkt.set(bytes, 2);
       activeRelayEntry.client.publish(frameTopic, pkt, { qos: 0 });
@@ -600,15 +616,14 @@ function startMseRelay(mime, hasAudio) {
         lastRateTick = now;
         updateTeacherBadge();
       }
-    }).catch(err => console.warn('Chunk send error:', err));
+    }).catch(() => {});
   };
 
-  // 100ms chunks = ultra-low latency + smooth 25–30 FPS video
   mediaRecorder.start(100);
   updateTeacherBadge();
 }
 
-/* ===== Fallback: Binary WebP/JPEG Frames (only if smart board lacks MSE) ===== */
+/* ===== Fallback: Binary WebP/JPEG Frames ===== */
 function startImageFallbackRelay() {
   activeStreamMode = 'IMG';
   relayVideoEl = document.createElement('video');
@@ -829,7 +844,7 @@ $('btnAccept').onclick = () => {
   role = 'board';
   entered = '';
   updateDisplay();
-  $('err').textContent = '';
+  setBoardMsg('');
   show('enter');
 };
 $('enterBack').onclick = resetAll;
@@ -863,6 +878,7 @@ $('btnJoin').onclick = join;
 function initBoardMse(gen, mime, hasAudio) {
   teardownBoardMse();
   activeMseGen = gen;
+  mseChunksSeen = 0;
 
   const v = $('remote');
   v.muted = true;
@@ -871,6 +887,7 @@ function initBoardMse(gen, mime, hasAudio) {
   $('remoteCanvas').style.display = 'none';
   $('btnMute').textContent = '🔇 Unmute';
   $('btnMute').style.display = hasAudio ? 'inline-block' : 'none';
+  $('btnCompatFrames').style.display = 'inline-block';
 
   try {
     mseSource = new MediaSource();
@@ -897,14 +914,18 @@ function initBoardMse(gen, mime, hasAudio) {
     }
   }, { once: true });
 
-  // Live-edge latency sync: keeps playback tight (~150-350ms behind live edge)
+  // Watchdog: if video chunks arrive but smart board cannot decode within 3s, auto-switch to Compat Frames
+  mseWatchdog = setTimeout(() => {
+    if (activeMseGen === gen && mseChunksSeen > 3 && v.readyState < 2) {
+      requestImgFallback();
+    }
+  }, 3000);
+
   mseSyncTimer = setInterval(() => {
     if (!v.buffered || v.buffered.length === 0) return;
     const end = v.buffered.end(v.buffered.length - 1);
     const lag = end - v.currentTime;
-    if (v.paused && lag > 0.05) {
-      v.play().catch(() => {});
-    }
+    if (v.paused && lag > 0.05) v.play().catch(() => {});
     if (lag > 0.55) {
       v.currentTime = Math.max(0, end - 0.12);
       v.playbackRate = 1.0;
@@ -943,7 +964,6 @@ function drainMseQueue() {
         try { mseBuffer.remove(v.buffered.start(0), Math.max(v.buffered.start(0), v.currentTime - 1)); } catch (_) {}
       }
     } else {
-      console.warn('MSE append error, requesting reset:', e);
       if (activeRelayEntry && activeRelayEntry.client.connected) {
         activeRelayEntry.client.publish(TOPIC_BASE + sessionCode + '/to-host', JSON.stringify({ type: 'need-reset' }));
       }
@@ -953,10 +973,16 @@ function drainMseQueue() {
 
 function requestImgFallback() {
   teardownBoardMse();
+  $('btnCompatFrames').style.display = 'none';
   if (activeRelayEntry && activeRelayEntry.client.connected && sessionCode) {
     activeRelayEntry.client.publish(TOPIC_BASE + sessionCode + '/to-host', JSON.stringify({ type: 'fallback-img' }));
   }
 }
+
+$('btnCompatFrames').onclick = e => {
+  e.stopPropagation();
+  requestImgFallback();
+};
 
 /* ===== Board Fallback Image-Frame Renderer ===== */
 function renderBoardFrame(blob) {
@@ -1001,7 +1027,7 @@ function renderBoardFrame(blob) {
 
 /* ======================= BOARD: JOIN ======================= */
 function join() {
-  if (entered.length !== 6) { $('err').textContent = 'Please enter all 6 digits.'; return; }
+  if (entered.length !== 6) { setBoardMsg('Please enter all 6 digits.'); return; }
   sessionCode = entered;
   try { peer && peer.destroy(); } catch (e) {}
   closeAllMqtt(false);
@@ -1013,7 +1039,7 @@ function join() {
 }
 
 function joinViaDirectFirst() {
-  $('err').textContent = 'Trying Direct HD connection…';
+  setBoardMsg('Trying Direct HD connection…', true);
   boardMode = 'direct';
   let opened = false, fellBack = false;
 
@@ -1024,10 +1050,10 @@ function joinViaDirectFirst() {
     try { peer && peer.destroy(); } catch (e) {}
     peer = conn = null;
     if (window.mqtt) {
-      $('err').textContent = reason + ' Switching to College Wi-Fi Relay…';
+      setBoardMsg(reason + ' Switching to College Wi-Fi Relay…', true);
       joinViaRelay();
     } else {
-      $('err').textContent = 'Direct connection blocked and MQTT library unavailable.';
+      setBoardMsg('Direct connection blocked and MQTT library unavailable.');
     }
   };
 
@@ -1052,7 +1078,7 @@ function joinViaDirectFirst() {
       if (fellBack) return;
       opened = true;
       clearTimeout(directTimeout);
-      $('err').textContent = '';
+      setBoardMsg('');
       enterViewer('direct');
     });
     conn.on('data', d => {
@@ -1103,7 +1129,7 @@ function upgradeViewerToRelay() {
   try { conn && conn.close(); } catch (e) {}
   try { peer && peer.destroy(); } catch (e) {}
   peer = conn = call = null;
-  $('waitText').textContent = 'Switching to College Wi-Fi Relay (Port 443)…';
+  $('waitText').textContent = 'Switching to College Wi-Fi Relay…';
   $('waiting').style.display = 'flex';
   $('btnSwitchRelay').style.display = 'none';
   joinViaRelay(true);
@@ -1115,21 +1141,27 @@ $('btnSwitchRelay').onclick = e => {
 };
 
 function joinViaRelay(alreadyInViewer = false) {
-  if (!window.mqtt) { $('err').textContent = 'Relay library (MQTT) not loaded.'; return; }
+  if (!window.mqtt) { setBoardMsg('Relay library (MQTT) not loaded.'); return; }
   boardMode = 'relay';
-  if (!alreadyInViewer) $('err').textContent = 'Connecting via College Wi-Fi Relay…';
+  const prettyCode = sessionCode.slice(0, 3) + ' ' + sessionCode.slice(3);
+  if (!alreadyInViewer) setBoardMsg('Searching for session ' + prettyCode + '…', true);
 
   const toHostTopic  = TOPIC_BASE + sessionCode + '/to-host';
   const toBoardTopic = TOPIC_BASE + sessionCode + '/to-board';
   const stateTopic   = TOPIC_BASE + sessionCode + '/state';
   const frameTopic   = TOPIC_BASE + sessionCode + '/frame';
 
+  const myBoardId = Math.random().toString(16).slice(2, 10);
+  const mseCodecs = getSupportedMseCodecs();
   let joined = false;
   const boardConnectedBrokers = new Set();
-  const joinPayload = JSON.stringify({
-    type: 'join',
+
+  const joinPayload = JSON.stringify({ type: 'join', boardId: myBoardId });
+  const confirmPayload = JSON.stringify({
+    type: 'confirm',
+    boardId: myBoardId,
     webp: CAN_WEBP,
-    mse: getSupportedMseCodecs()
+    mse: mseCodecs
   });
 
   function sendJoinOnAll() {
@@ -1141,18 +1173,18 @@ function joinViaRelay(alreadyInViewer = false) {
     });
   }
 
-  joinRetryTimer = setInterval(sendJoinOnAll, 1500);
+  joinRetryTimer = setInterval(sendJoinOnAll, 1400);
 
   const relayTimeout = setTimeout(() => {
     if (joined) return;
     const reached = [...boardConnectedBrokers];
     closeAllMqtt(false);
     const msg = reached.length > 0
-      ? 'Session not found on [' + reached.join(', ') + ']. Hard-refresh the teacher laptop and retry.'
+      ? 'Session ' + prettyCode + ' not found. Check the code and verify both screens say "ClassCast v6" at bottom-right.'
       : 'Could not reach any relay server (blocked by firewall or offline).';
     if (alreadyInViewer) { alert(msg); resetAll(); }
-    else $('err').textContent = msg;
-  }, 10000);
+    else setBoardMsg(msg, false);
+  }, 9000);
 
   MQTT_BROKERS.forEach(broker => {
     try {
@@ -1169,7 +1201,7 @@ function joinViaRelay(alreadyInViewer = false) {
         if (joined && entry !== activeRelayEntry) { client.end(true); return; }
         boardConnectedBrokers.add(broker.name);
         if (!alreadyInViewer && !joined) {
-          $('err').textContent = 'Connected to ' + [...boardConnectedBrokers].join(', ') + '. Waiting for teacher…';
+          setBoardMsg('Searching for session ' + prettyCode + ' (' + boardConnectedBrokers.size + ' relays ready)…', true);
         }
         client.subscribe([toBoardTopic, frameTopic, stateTopic], () => {
           client.publish(toHostTopic, joinPayload);
@@ -1185,14 +1217,16 @@ function joinViaRelay(alreadyInViewer = false) {
           let msg;
           try { msg = JSON.parse(decodePayload(payload)); } catch (e) { return; }
 
-          if (msg.type === 'hello' && !joined) {
+          if (msg.type === 'hello' && msg.boardId === myBoardId && !joined) {
             joined = true;
             clearTimeout(relayTimeout);
             clearInterval(joinRetryTimer);
             activeRelayEntry = entry;
+            // Close all other brokers so teacher & board stay locked on this exact one
             mqttEntries.forEach(e => { if (e !== entry) { try { e.client.end(true); } catch (_) {} } });
             mqttEntries = [entry];
-            $('err').textContent = '';
+            client.publish(toHostTopic, confirmPayload);
+            setBoardMsg('');
             enterViewer('relay', broker.name);
           } else if (msg.type === 'stopped' && entry === activeRelayEntry) {
             teardownBoardMse();
@@ -1203,33 +1237,21 @@ function joinViaRelay(alreadyInViewer = false) {
             resetAll();
           }
         } else if (topic === frameTopic) {
-          if (!joined) {
-            joined = true;
-            clearTimeout(relayTimeout);
-            clearInterval(joinRetryTimer);
-            activeRelayEntry = entry;
-            mqttEntries.forEach(e => { if (e !== entry) { try { e.client.end(true); } catch (_) {} } });
-            mqttEntries = [entry];
-            enterViewer('relay', broker.name);
-          }
           if (entry !== activeRelayEntry || !payload || payload.length < 3) return;
-
           const type = payload[0];
           const gen = payload[1];
 
           if (type === 4) {
-            // MSE stream start metadata
             try {
               const meta = JSON.parse(decodePayload(payload.subarray(2)));
               initBoardMse(gen, meta.mime, !!meta.audio);
             } catch (e) { requestImgFallback(); }
           } else if (type === 3) {
-            // Live compressed video chunk
             if (gen !== activeMseGen) return;
+            mseChunksSeen++;
             mseQueue.push(payload.slice(2));
             drainMseQueue();
           } else if (type === 1 || type === 2) {
-            // Fallback WebP/JPEG frame
             const blob = new Blob([payload.subarray(2)], { type: type === 1 ? 'image/webp' : 'image/jpeg' });
             renderBoardFrame(blob);
           }
