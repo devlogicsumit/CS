@@ -48,14 +48,14 @@
   .keypad button{height:78px;font-size:30px;font-weight:700;background:var(--card);color:var(--text);
     border:0;border-radius:16px;cursor:pointer}
   .keypad button:active{background:var(--accent)}
-  .err{color:#fca5a5;min-height:1.4em;margin-bottom:12px}
+  .err{color:#fca5a5;min-height:1.4em;margin-bottom:12px;max-width:520px}
   /* viewer */
   #viewer{padding:0;background:#000;position:fixed;inset:0;justify-content:center}
   #remote{width:100%;height:100%;object-fit:contain;background:#000}
   #waiting{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
-    background:#0f172a;font-size:clamp(22px,3.5vw,40px);gap:14px}
+    background:#0f172a;font-size:clamp(22px,3.5vw,40px);gap:14px;padding:24px}
   #toolbar{position:absolute;top:0;left:0;right:0;display:flex;gap:12px;justify-content:center;padding:16px;
-    background:linear-gradient(#000a,#0000);transition:opacity .3s}
+    background:linear-gradient(#000a,#0000);transition:opacity .3s;z-index:10}
   #toolbar.hide{opacity:0;pointer-events:none}
   .viewer-hidecursor{cursor:none}
 </style>
@@ -68,7 +68,7 @@
   <p class="sub">Share your screen to the classroom board</p>
   <div id="libWarn" style="display:none;background:#7f1d1d;color:#fecaca;padding:14px 20px;border-radius:12px;margin-bottom:24px;max-width:640px;font-size:16px">
     The connection library (PeerJS) could not be loaded, so sharing can't start.
-    Check the internet connection, or download <b>peerjs.min.js</b> and put it in the same folder as <b>index.html</b> on GitHub. Then reload this page.
+    Check the internet connection, or ensure <b>peerjs.min.js</b> is in the same folder as <b>index.html</b>.
   </div>
   <div class="choices">
     <button class="big" id="btnCreate">
@@ -114,44 +114,88 @@
 
 <!-- BOARD: VIEWER -->
 <div id="viewer" class="view">
-  <video id="remote" autoplay playsinline></video>
-  <div id="waiting"><div style="font-size:64px">✅</div><div>Connected. Waiting for the teacher to start sharing…</div></div>
+  <!-- Muted by default so smart board browsers NEVER block autoplay -->
+  <video id="remote" autoplay playsinline muted></video>
+  <div id="waiting">
+    <div style="font-size:64px">✅</div>
+    <div id="waitText">Connected. Waiting for the teacher to start sharing…</div>
+  </div>
   <div id="toolbar">
+    <button class="btn ghost" id="btnMute">🔇 Unmute</button>
     <button class="btn" id="btnFull">⛶ Full screen</button>
     <button class="btn red" id="btnLeave">Disconnect</button>
   </div>
 </div>
 
-<!-- PeerJS: local copy first, then several CDNs as fallbacks -->
+<!-- PeerJS: local copy first, then CDN fallbacks -->
 <script src="peerjs.min.js"></script>
 <script>window.Peer || document.write('<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"><\/script>')</script>
 <script>window.Peer || document.write('<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"><\/script>')</script>
-<script>window.Peer || document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"><\/script>')</script>
 <!-- pdf.js (only needed for sharing PDF files) -->
 <script src="pdf.min.js"></script>
 <script>window.pdfjsLib || document.write('<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"><\/script>')</script>
-<script>window.pdfjsLib || document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"><\/script>')</script>
 <script>
+/* =====================================================================
+   COLLEGE WI-FI FIREWALL BYPASS (TURN OVER PORT 443)
+   1. Sign up free at https://www.metered.ca/tools/openrelay/
+   2. Paste your Metered TURN Credentials API URL below:
+   ===================================================================== */
+const TURN_API_URL = 'https://YOUR_APP_NAME.metered.live/api/v1/turn/credentials?apiKey=YOUR_API_KEY';
+
+const FALLBACK_ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' }
+];
+
+async function getPeerConfig() {
+  let iceServers = [...FALLBACK_ICE_SERVERS];
+  if (TURN_API_URL && !TURN_API_URL.includes('YOUR_APP_NAME')) {
+    try {
+      const res = await fetch(TURN_API_URL);
+      if (res.ok) {
+        const fetched = await res.json();
+        if (Array.isArray(fetched) && fetched.length > 0) {
+          iceServers = [...FALLBACK_ICE_SERVERS, ...fetched];
+        }
+      }
+    } catch (e) {
+      console.warn('Could not fetch TURN credentials, falling back to STUN:', e);
+    }
+  }
+  return {
+    debug: 1,
+    config: {
+      iceServers,
+      iceCandidatePoolSize: 10
+    }
+  };
+}
+
 const PREFIX = 'classcast-v1-';
 const $ = id => document.getElementById(id);
-if (!window.Peer){
+
+if (!window.Peer) {
   $('libWarn').style.display = 'block';
-  $('btnCreate').disabled = true; $('btnAccept').disabled = true;
+  $('btnCreate').disabled = true;
+  $('btnAccept').disabled = true;
 }
+
 let peer = null, conn = null, call = null;
 let stream = null, fileCleanup = null;
 
-function show(id){
+function show(id) {
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
   $(id).classList.add('active');
 }
-function resetAll(){
+
+function resetAll() {
   stopShare(false);
-  try{ call && call.close(); }catch(e){}
-  try{ conn && conn.close(); }catch(e){}
-  try{ peer && peer.destroy(); }catch(e){}
+  try { call && call.close(); } catch (e) {}
+  try { conn && conn.close(); } catch (e) {}
+  try { peer && peer.destroy(); } catch (e) {}
   peer = conn = call = null;
-  if (document.fullscreenElement) document.exitFullscreen().catch(()=>{});
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
   $('remote').srcObject = null;
   show('home');
 }
@@ -160,68 +204,85 @@ function resetAll(){
 $('btnCreate').onclick = () => { show('teacher'); startSession(); };
 $('teacherBack').onclick = resetAll;
 
-function genCode(){ return String(Math.floor(100000 + Math.random()*900000)); }
-function setStatus(t, ok){ const s=$('tStatus'); s.textContent=t; s.classList.toggle('ok', !!ok); }
+function genCode() { return String(Math.floor(100000 + Math.random() * 900000)); }
+function setStatus(t, ok) { const s = $('tStatus'); s.textContent = t; s.classList.toggle('ok', !!ok); }
 
-function startSession(){
+async function startSession() {
   const code = genCode();
   $('code').textContent = '······';
-  setStatus('Creating session…');
-  peer = new Peer(PREFIX + code);
+  setStatus('Fetching network relays & creating session…');
+  const peerOptions = await getPeerConfig();
+  peer = new Peer(PREFIX + code, peerOptions);
+
   peer.on('open', () => {
-    $('code').textContent = code.slice(0,3) + ' ' + code.slice(3);
+    $('code').textContent = code.slice(0, 3) + ' ' + code.slice(3);
     setStatus('Waiting for the board to connect…');
   });
+
   peer.on('error', e => {
-    if (e.type === 'unavailable-id'){ try{peer.destroy();}catch(_){} startSession(); }
-    else setStatus('Connection problem: ' + e.type + ' — check internet and press Back, then try again.');
+    if (e.type === 'unavailable-id') {
+      try { peer.destroy(); } catch (_) {}
+      startSession();
+    } else {
+      setStatus('Connection problem (' + e.type + ') — check Wi-Fi and press Back to retry.');
+    }
   });
-  peer.on('disconnected', () => { try{ peer.reconnect(); }catch(e){} });
+
+  peer.on('disconnected', () => {
+    setStatus('Signaling dropped, reconnecting…');
+    try { peer.reconnect(); } catch (e) {}
+  });
+
   peer.on('connection', c => {
     conn = c;
     c.on('open', () => {
       setStatus('Board connected ✔', true);
       if (stream) callBoard();
     });
-    c.on('close', () => { setStatus('Board disconnected. Waiting for it to connect again…'); conn = null; });
+    c.on('close', () => {
+      setStatus('Board disconnected. Waiting for it to connect again…');
+      conn = null;
+    });
   });
 }
 
-function callBoard(){
+function callBoard() {
   if (!conn || !stream) return;
-  try{ call && call.close(); }catch(e){}
+  try { call && call.close(); } catch (e) {}
   call = peer.call(conn.peer, stream);
+  call.on('error', e => setStatus('Stream error: ' + e.message));
 }
 
-function setStream(s){
+function setStream(s) {
   stopShare(false);
   stream = s;
   $('btnStop').disabled = false;
   callBoard();
 }
 
-function stopShare(notify = true){
-  if (fileCleanup){ fileCleanup(); fileCleanup = null; }
-  if (stream){ stream.getTracks().forEach(t => t.stop()); stream = null; }
-  try{ call && call.close(); }catch(e){}
+function stopShare(notify = true) {
+  if (fileCleanup) { fileCleanup(); fileCleanup = null; }
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  try { call && call.close(); } catch (e) {}
   call = null;
   $('preview').style.display = 'none';
   $('preview').innerHTML = '';
   $('pager').style.display = 'none';
   $('btnStop').disabled = true;
-  if (notify && conn && conn.open) conn.send({type:'stopped'});
+  if (notify && conn && conn.open) conn.send({ type: 'stopped' });
 }
 $('btnStop').onclick = () => stopShare(true);
 
-function showPreview(el){
+function showPreview(el) {
   const p = $('preview'); p.innerHTML = ''; p.appendChild(el); p.style.display = 'block';
 }
 
 /* Screen share */
 $('btnScreen').onclick = async () => {
-  try{
+  try {
     const s = await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: 30 }, audio: true
+      video: { frameRate: { ideal: 30, max: 30 } },
+      audio: true
     });
     const vt = s.getVideoTracks()[0];
     if (vt && 'contentHint' in vt) vt.contentHint = 'detail';
@@ -230,7 +291,7 @@ $('btnScreen').onclick = async () => {
     const v = document.createElement('video');
     v.muted = true; v.autoplay = true; v.playsInline = true; v.srcObject = s;
     showPreview(v);
-  }catch(e){
+  } catch (e) {
     if (e.name !== 'NotAllowedError') alert('Could not start screen sharing: ' + e.message);
   }
 };
@@ -240,54 +301,54 @@ $('btnFile').onclick = () => $('fileInput').click();
 $('fileInput').onchange = async e => {
   const f = e.target.files[0]; e.target.value = '';
   if (!f) return;
-  try{
+  try {
     if (f.type.startsWith('video/')) await shareVideo(f);
     else if (f.type === 'application/pdf') await sharePDF(f);
     else if (f.type.startsWith('image/')) await shareImage(f);
     else alert('Unsupported file type. Use an image, PDF or video.');
-  }catch(err){ alert('Could not open file: ' + err.message); }
+  } catch (err) { alert('Could not open file: ' + err.message); }
 };
 
-function makeCanvasStream(){
+function makeCanvasStream() {
   const c = document.createElement('canvas');
   c.width = 1920; c.height = 1080;
   return { c, ctx: c.getContext('2d') };
 }
-function drawContain(ctx, c, src, sw, sh){
+function drawContain(ctx, c, src, sw, sh) {
   ctx.fillStyle = '#111'; ctx.fillRect(0, 0, c.width, c.height);
   const r = Math.min(c.width / sw, c.height / sh);
   const w = sw * r, h = sh * r;
-  ctx.drawImage(src, (c.width - w)/2, (c.height - h)/2, w, h);
+  ctx.drawImage(src, (c.width - w) / 2, (c.height - h) / 2, w, h);
 }
 
-async function shareImage(f){
+async function shareImage(f) {
   const url = URL.createObjectURL(f);
   const img = new Image(); img.src = url; await img.decode();
-  const {c, ctx} = makeCanvasStream();
+  const { c, ctx } = makeCanvasStream();
   const draw = () => drawContain(ctx, c, img, img.naturalWidth, img.naturalHeight);
   draw();
-  const timer = setInterval(draw, 500);   // keeps frames flowing to the board
+  const timer = setInterval(draw, 500);
   setStream(c.captureStream(15));
   fileCleanup = () => { clearInterval(timer); URL.revokeObjectURL(url); };
   c.style.cssText = 'width:100%;display:block';
   showPreview(c);
 }
 
-async function sharePDF(f){
+async function sharePDF(f) {
   if (!window.pdfjsLib) throw new Error('PDF library could not be loaded (check internet).');
   pdfjsLib.GlobalWorkerOptions.workerSrc =
     'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-  const pdf = await pdfjsLib.getDocument({data: await f.arrayBuffer()}).promise;
-  const {c, ctx} = makeCanvasStream();
+  const pdf = await pdfjsLib.getDocument({ data: await f.arrayBuffer() }).promise;
+  const { c, ctx } = makeCanvasStream();
   let pageNum = 1, pageCanvas = null;
-  async function render(n){
+  async function render(n) {
     const page = await pdf.getPage(n);
-    const vp = page.getViewport({scale: 2.5});
+    const vp = page.getViewport({ scale: 2.5 });
     const pc = document.createElement('canvas');
     pc.width = vp.width; pc.height = vp.height;
     const pctx = pc.getContext('2d');
-    pctx.fillStyle = '#fff'; pctx.fillRect(0,0,pc.width,pc.height);
-    await page.render({canvasContext: pctx, viewport: vp}).promise;
+    pctx.fillStyle = '#fff'; pctx.fillRect(0, 0, pc.width, pc.height);
+    await page.render({ canvasContext: pctx, viewport: vp }).promise;
     pageCanvas = pc; pageNum = n;
     $('pageInfo').textContent = 'Page ' + n + ' / ' + pdf.numPages;
     draw();
@@ -304,12 +365,12 @@ async function sharePDF(f){
   showPreview(c);
 }
 
-async function shareVideo(f){
+async function shareVideo(f) {
   const url = URL.createObjectURL(f);
   const v = document.createElement('video');
   v.src = url; v.controls = true; v.playsInline = true;
   await new Promise((res, rej) => { v.onloadedmetadata = res; v.onerror = () => rej(new Error('video not supported')); });
-  await v.play().catch(()=>{});
+  await v.play().catch(() => {});
   const s = v.captureStream ? v.captureStream() : v.mozCaptureStream();
   setStream(s);
   fileCleanup = () => { v.pause(); URL.revokeObjectURL(url); };
@@ -318,25 +379,25 @@ async function shareVideo(f){
 
 /* ======================= BOARD: ENTER CODE ======================= */
 let entered = '';
-$('btnAccept').onclick = () => { entered = ''; updateDisplay(); $('err').textContent=''; show('enter'); };
+$('btnAccept').onclick = () => { entered = ''; updateDisplay(); $('err').textContent = ''; show('enter'); };
 $('enterBack').onclick = resetAll;
 
-(function buildKeypad(){
+(function buildKeypad() {
   const k = $('keypad');
-  ['1','2','3','4','5','6','7','8','9','C','0','⌫'].forEach(label => {
+  ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'C', '0', '⌫'].forEach(label => {
     const b = document.createElement('button'); b.textContent = label;
     b.onclick = () => press(label); k.appendChild(b);
   });
 })();
-function press(l){
+function press(l) {
   if (l === 'C') entered = '';
-  else if (l === '⌫') entered = entered.slice(0,-1);
+  else if (l === '⌫') entered = entered.slice(0, -1);
   else if (entered.length < 6) entered += l;
   updateDisplay();
 }
-function updateDisplay(){
+function updateDisplay() {
   const e = entered.padEnd(6, '·');
-  $('display').textContent = e.slice(0,3) + ' ' + e.slice(3);
+  $('display').textContent = e.slice(0, 3) + ' ' + e.slice(3);
 }
 document.addEventListener('keydown', ev => {
   if (!$('enter').classList.contains('active')) return;
@@ -347,47 +408,76 @@ document.addEventListener('keydown', ev => {
 $('btnJoin').onclick = join;
 
 /* ======================= BOARD: JOIN + VIEW ======================= */
-function join(){
-  if (entered.length !== 6){ $('err').textContent = 'Please enter all 6 digits.'; return; }
-  $('err').textContent = 'Connecting…';
-  try{ peer && peer.destroy(); }catch(e){}
-  peer = new Peer();
+async function join() {
+  if (entered.length !== 6) { $('err').textContent = 'Please enter all 6 digits.'; return; }
+  $('err').textContent = 'Fetching relays & connecting…';
+  try { peer && peer.destroy(); } catch (e) {}
+
+  const peerOptions = await getPeerConfig();
+  peer = new Peer(undefined, peerOptions);
+
   let opened = false;
-  const fail = msg => { $('err').textContent = msg; try{peer.destroy();}catch(e){} };
-  const timeout = setTimeout(() => { if (!opened) fail('Could not connect. Check the code and internet.'); }, 12000);
+  const fail = msg => { $('err').textContent = msg; try { peer.destroy(); } catch (e) {} };
+  const timeout = setTimeout(() => {
+    if (!opened) fail('Timed out. College firewall may be blocking WebRTC — verify your TURN_API_URL is set.');
+  }, 15000);
 
   peer.on('open', () => {
-    conn = peer.connect(PREFIX + entered, {reliable: true});
+    $('err').textContent = 'Signaling OK. Establishing P2P/Relay tunnel…';
+    conn = peer.connect(PREFIX + entered, { reliable: true });
+
+    conn.on('iceStateChanged', state => {
+      if (state === 'failed' && !opened) {
+        clearTimeout(timeout);
+        fail('Firewall blocked direct connection (ICE failed). Add a Port-443 TURN key.');
+      }
+    });
+
     conn.on('open', () => {
       opened = true; clearTimeout(timeout);
       $('err').textContent = '';
       enterViewer();
     });
-    conn.on('data', d => { if (d && d.type === 'stopped') $('waiting').style.display = 'flex'; });
-    conn.on('close', () => { if (opened) { alert('The teacher ended the session.'); resetAll(); } });
+
+    conn.on('data', d => {
+      if (d && d.type === 'stopped') {
+        $('waitText').textContent = 'Connected. Waiting for the teacher to start sharing…';
+        $('waiting').style.display = 'flex';
+      }
+    });
+
+    conn.on('close', () => {
+      if (opened) { alert('The teacher ended the session.'); resetAll(); }
+    });
   });
+
   peer.on('call', c => {
     c.answer();
     c.on('stream', s => {
-      const v = $('remote'); v.srcObject = s; v.play().catch(()=>{});
+      const v = $('remote');
+      v.srcObject = s;
+      v.muted = true; // Guarantee autoplay works on smart boards
+      $('btnMute').textContent = '🔇 Unmute';
+      v.play().catch(err => console.warn('Autoplay warning:', err));
       $('waiting').style.display = 'none';
     });
   });
+
   peer.on('error', e => {
     clearTimeout(timeout);
-    if (e.type === 'peer-unavailable') fail('Session not found. Check the code.');
-    else if (!opened) fail('Connection problem: ' + e.type);
+    if (e.type === 'peer-unavailable') fail('Session not found. Check the 6-digit code.');
+    else if (!opened) fail('Connection error (' + e.type + '). Check internet/firewall.');
   });
 }
 
 let hideTimer = null;
-function enterViewer(){
+function enterViewer() {
   show('viewer');
   $('waiting').style.display = 'flex';
   showToolbar();
-  try{ navigator.wakeLock && navigator.wakeLock.request('screen').catch(()=>{}); }catch(e){}
+  try { navigator.wakeLock && navigator.wakeLock.request('screen').catch(() => {}); } catch (e) {}
 }
-function showToolbar(){
+function showToolbar() {
   $('toolbar').classList.remove('hide');
   $('viewer').classList.remove('viewer-hidecursor');
   clearTimeout(hideTimer);
@@ -396,16 +486,23 @@ function showToolbar(){
     $('viewer').classList.add('viewer-hidecursor');
   }, 3500);
 }
-['mousemove','touchstart','click'].forEach(ev =>
+['mousemove', 'touchstart', 'click'].forEach(ev =>
   $('viewer').addEventListener(ev, () => { if ($('viewer').classList.contains('active')) showToolbar(); }));
 
-function updateFullBtn(){
+$('btnMute').onclick = e => {
+  e.stopPropagation();
+  const v = $('remote');
+  v.muted = !v.muted;
+  $('btnMute').textContent = v.muted ? '🔇 Unmute' : '🔊 Mute';
+};
+
+function updateFullBtn() {
   $('btnFull').textContent = document.fullscreenElement ? '✕ Exit full screen' : '⛶ Full screen';
 }
 $('btnFull').onclick = e => {
   e.stopPropagation();
   if (document.fullscreenElement) document.exitFullscreen();
-  else document.documentElement.requestFullscreen().catch(()=>alert('Full screen is not allowed by this browser.'));
+  else document.documentElement.requestFullscreen().catch(() => alert('Full screen is not allowed by this browser.'));
 };
 document.addEventListener('fullscreenchange', updateFullBtn);
 $('btnLeave').onclick = e => { e.stopPropagation(); resetAll(); };
