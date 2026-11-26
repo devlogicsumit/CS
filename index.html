@@ -36,8 +36,8 @@
     font-variant-numeric:tabular-nums}
   .status{color:var(--muted);font-size:18px;margin-bottom:8px}
   .status.ok{color:var(--accent2)}
-  .badge{display:inline-block;font-size:13px;padding:5px 12px;border-radius:999px;
-    background:#1e293b;color:var(--muted);margin-bottom:20px}
+  .badge{display:inline-block;font-size:13px;padding:6px 14px;border-radius:999px;
+    background:#1e293b;color:var(--muted);margin-bottom:20px;max-width:92vw}
   .row{display:flex;gap:14px;flex-wrap:wrap;justify-content:center;margin:10px 0}
   .preview{margin-top:20px;width:min(640px,92vw);background:#000;border-radius:14px;overflow:hidden;
     display:none}
@@ -54,7 +54,7 @@
   .keypad button{height:78px;font-size:30px;font-weight:700;background:var(--card);color:var(--text);
     border:0;border-radius:16px;cursor:pointer}
   .keypad button:active{background:var(--accent)}
-  .err{color:#fca5a5;min-height:1.4em;margin-bottom:12px;max-width:520px;font-size:16px}
+  .err{color:#fca5a5;min-height:1.4em;margin-bottom:12px;max-width:560px;font-size:15px;line-height:1.4}
   /* viewer */
   #viewer{padding:0;background:#000;position:fixed;inset:0;justify-content:center}
   #remote,#remoteImg{width:100%;height:100%;object-fit:contain;background:#000}
@@ -116,7 +116,7 @@
   <p class="sub" style="margin-bottom:14px">Enter the code shown on the teacher's laptop</p>
   <div class="display" id="display"></div>
   <label class="modeToggle">
-    <input type="checkbox" id="chkRelay">
+    <input type="checkbox" id="chkRelay" checked>
     <span>⚡ College Wi-Fi Mode (Firewall Bypass — Port 443)</span>
   </label>
   <div class="err" id="err"></div>
@@ -145,10 +145,10 @@
 <script>window.Peer || document.write('<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"><\/script>')</script>
 <script>window.Peer || document.write('<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"><\/script>')</script>
 
-<!-- MQTT.js (for Port 443 College Wi-Fi Firewall Bypass): local first, then CDNs -->
+<!-- MQTT.js: local first, then pinned CDN fallbacks -->
 <script src="mqtt.min.js"></script>
-<script>window.mqtt || document.write('<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"><\/script>')</script>
-<script>window.mqtt || document.write('<script src="https://cdn.jsdelivr.net/npm/mqtt/dist/mqtt.min.js"><\/script>')</script>
+<script>window.mqtt || document.write('<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"><\/script>')</script>
+<script>window.mqtt || document.write('<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"><\/script>')</script>
 
 <!-- pdf.js (only needed for sharing PDF files) -->
 <script src="pdf.min.js"></script>
@@ -157,15 +157,20 @@
 
 <script>
 const PREFIX = 'classcast-v1-';
-const TOPIC_BASE = 'classcast/v2/';
-// Port 443 broker listed FIRST to bypass strict college firewalls
+const TOPIC_BASE = 'classcast/v3/';
+
 const MQTT_BROKERS = [
-  'wss://mqtt.eclipseprojects.io:443/mqtt',
-  'wss://broker.emqx.io:8084/mqtt',
-  'wss://broker.hivemq.com:8884/mqtt'
+  { name: 'Eclipse-443', url: 'wss://mqtt.eclipseprojects.io:443/mqtt' },
+  { name: 'EMQX-8084',   url: 'wss://broker.emqx.io:8084/mqtt' },
+  { name: 'HiveMQ-8884', url: 'wss://broker.hivemq.com:8884/mqtt' },
+  { name: 'Mosq-8081',   url: 'wss://test.mosquitto.org:8081' }
 ];
 
 const $ = id => document.getElementById(id);
+const decoder = new TextDecoder();
+function decodePayload(p) {
+  return typeof p === 'string' ? p : decoder.decode(p);
+}
 
 if (!window.Peer && !window.mqtt) {
   $('libWarn').style.display = 'block';
@@ -180,15 +185,16 @@ let peer = null, conn = null, call = null;
 let stream = null, fileCleanup = null;
 
 // MQTT Relay state
-let mqttClients = [];
-let activeRelayClient = null;
+let mqttEntries = []; // { name, client }
+let activeRelayEntry = null;
 let relayConnected = false;
 let relayLoopTimer = null;
+let joinRetryTimer = null;
 let relayVideoEl = null;
 let relayCanvas = null, relayCtx = null;
 let diffCanvas = null, diffCtx = null, lastThumb = null;
 let lastFrameTime = 0, sharpSent = false;
-let boardMode = 'direct'; // 'direct' | 'relay'
+let boardMode = 'relay'; // 'direct' | 'relay'
 let mediaFallbackTimer = null;
 
 function show(id) {
@@ -197,12 +203,21 @@ function show(id) {
 }
 
 function closeAllMqtt(sendEnd = false) {
-  if (sendEnd && activeRelayClient && activeRelayClient.connected && sessionCode) {
-    try { activeRelayClient.publish(TOPIC_BASE + sessionCode + '/ctrl', JSON.stringify({ type: 'end' })); } catch (e) {}
+  clearInterval(joinRetryTimer);
+  joinRetryTimer = null;
+  if (sendEnd && sessionCode) {
+    mqttEntries.forEach(({ client }) => {
+      if (client && client.connected) {
+        try {
+          client.publish(TOPIC_BASE + sessionCode + '/state', '', { retain: true });
+          client.publish(TOPIC_BASE + sessionCode + '/to-board', JSON.stringify({ type: 'end' }));
+        } catch (e) {}
+      }
+    });
   }
-  mqttClients.forEach(c => { try { c.end(true); } catch (e) {} });
-  mqttClients = [];
-  activeRelayClient = null;
+  mqttEntries.forEach(({ client }) => { try { client.end(true); } catch (e) {} });
+  mqttEntries = [];
+  activeRelayEntry = null;
   relayConnected = false;
 }
 
@@ -237,13 +252,19 @@ $('teacherBack').onclick = resetAll;
 function genCode() { return String(Math.floor(100000 + Math.random() * 900000)); }
 function setStatus(t, ok) { const s = $('tStatus'); s.textContent = t; s.classList.toggle('ok', !!ok); }
 
-let peerReady = false, relayReadyCount = 0;
+let peerReady = false;
+let connectedBrokerNames = new Set();
+
 function updateTeacherBadge() {
   const parts = [];
   if (peerReady) parts.push('Direct HD ✔');
-  if (relayReadyCount > 0) parts.push('College Relay (Port 443) ✔');
+  if (connectedBrokerNames.size > 0) {
+    parts.push('Relay: ' + [...connectedBrokerNames].join(', ') + ' ✔');
+  } else if (!window.mqtt) {
+    parts.push('Relay library blocked ✖');
+  }
   $('tNetInfo').textContent = parts.length ? parts.join('  •  ') : 'Connecting to servers…';
-  if ((peerReady || relayReadyCount > 0) && $('code').textContent === '······') {
+  if ((peerReady || connectedBrokerNames.size > 0) && $('code').textContent === '······') {
     $('code').textContent = sessionCode.slice(0, 3) + ' ' + sessionCode.slice(3);
     setStatus('Waiting for the board to connect…');
   }
@@ -252,12 +273,12 @@ function updateTeacherBadge() {
 function startSession() {
   sessionCode = genCode();
   peerReady = false;
-  relayReadyCount = 0;
+  connectedBrokerNames = new Set();
   $('code').textContent = '······';
   setStatus('Creating session…');
   updateTeacherBadge();
 
-  // 1. Start PeerJS (HD Direct) if available
+  // 1. PeerJS (Direct HD)
   if (window.Peer) {
     peer = new Peer(PREFIX + sessionCode, {
       config: {
@@ -275,7 +296,7 @@ function startSession() {
         closeAllMqtt(false);
         startSession();
       } else {
-        console.warn('PeerJS error (College Relay still active):', e.type);
+        console.warn('PeerJS error:', e.type);
       }
     });
     peer.on('disconnected', () => { try { peer.reconnect(); } catch (e) {} });
@@ -292,34 +313,42 @@ function startSession() {
     });
   }
 
-  // 2. Start MQTT Port-443 College Relay in parallel
+  // 2. MQTT Relay (multi-broker with Port 443 primary)
   if (window.mqtt) {
-    const ctrlTopic = TOPIC_BASE + sessionCode + '/ctrl';
-    MQTT_BROKERS.forEach(url => {
+    const toHostTopic  = TOPIC_BASE + sessionCode + '/to-host';
+    const toBoardTopic = TOPIC_BASE + sessionCode + '/to-board';
+    const stateTopic   = TOPIC_BASE + sessionCode + '/state';
+
+    MQTT_BROKERS.forEach(broker => {
       try {
-        const client = mqtt.connect(url, {
+        const client = mqtt.connect(broker.url, {
           clientId: 'cc_t_' + Math.random().toString(16).slice(2, 10),
           clean: true,
-          connectTimeout: 6000,
+          connectTimeout: 7000,
           reconnectPeriod: 4000
         });
-        mqttClients.push(client);
-        let counted = false;
+        const entry = { name: broker.name, client };
+        mqttEntries.push(entry);
 
         client.on('connect', () => {
-          if (!counted) { counted = true; relayReadyCount++; updateTeacherBadge(); }
-          client.subscribe(ctrlTopic);
+          connectedBrokerNames.add(broker.name);
+          updateTeacherBadge();
+          client.subscribe(toHostTopic, () => {
+            // Retained beacon so late/reconnecting boards immediately see host is alive
+            client.publish(stateTopic, JSON.stringify({ alive: true, ts: Date.now() }), { retain: true });
+          });
         });
 
         client.on('message', (topic, payload) => {
-          if (topic !== ctrlTopic) return;
+          if (topic !== toHostTopic) return;
           let msg;
-          try { msg = JSON.parse(new TextDecoder().decode(payload)); } catch (e) { return; }
+          try { msg = JSON.parse(decodePayload(payload)); } catch (e) { return; }
+
           if (msg.type === 'join') {
-            activeRelayClient = client;
+            activeRelayEntry = entry;
             relayConnected = true;
-            client.publish(ctrlTopic, JSON.stringify({ type: 'hello', sharing: !!stream }));
-            setStatus('Board connected (College Wi-Fi Relay) ✔', true);
+            client.publish(toBoardTopic, JSON.stringify({ type: 'hello', sharing: !!stream }));
+            setStatus('Board connected (' + broker.name + ' Relay) ✔', true);
             if (stream) {
               lastThumb = null;
               sharpSent = false;
@@ -332,7 +361,7 @@ function startSession() {
           }
         });
       } catch (e) {
-        console.warn('MQTT init error for', url, e);
+        console.warn('MQTT init error for', broker.name, e);
       }
     });
   }
@@ -341,7 +370,7 @@ function startSession() {
     if ($('code').textContent === '······') {
       setStatus('Could not reach servers — check internet and press Back to retry.');
     }
-  }, 9000);
+  }, 10000);
 }
 
 function callBoard() {
@@ -361,7 +390,7 @@ function stopRelayCapture() {
 
 function startRelayCapture() {
   stopRelayCapture();
-  if (!stream || !relayConnected || !activeRelayClient) return;
+  if (!stream || !relayConnected || !activeRelayEntry) return;
 
   relayVideoEl = document.createElement('video');
   relayVideoEl.muted = true;
@@ -380,10 +409,11 @@ function startRelayCapture() {
   const frameTopic = TOPIC_BASE + sessionCode + '/frame';
 
   function sendFrame(highRes) {
-    if (!relayVideoEl || relayVideoEl.readyState < 2 || !activeRelayClient || !activeRelayClient.connected) return;
+    const client = activeRelayEntry && activeRelayEntry.client;
+    if (!relayVideoEl || relayVideoEl.readyState < 2 || !client || !client.connected) return;
     const vw = relayVideoEl.videoWidth || 1280;
     const vh = relayVideoEl.videoHeight || 720;
-    const maxW = highRes ? 1600 : 1152;
+    const maxW = highRes ? 1500 : 1100;
     const scale = Math.min(1, maxW / vw);
     const w = Math.round(vw * scale);
     const h = Math.round(vh * scale);
@@ -393,13 +423,11 @@ function startRelayCapture() {
     }
     relayCtx.drawImage(relayVideoEl, 0, 0, w, h);
 
-    let quality = highRes ? 0.76 : 0.56;
-    let dataUrl = relayCanvas.toDataURL('image/jpeg', quality);
-    // Keep payload fast & under public broker packet limits
-    if (dataUrl.length > 170000) dataUrl = relayCanvas.toDataURL('image/jpeg', 0.42);
-    if (dataUrl.length > 220000) dataUrl = relayCanvas.toDataURL('image/jpeg', 0.30);
+    let dataUrl = relayCanvas.toDataURL('image/jpeg', highRes ? 0.74 : 0.54);
+    if (dataUrl.length > 150000) dataUrl = relayCanvas.toDataURL('image/jpeg', 0.40);
+    if (dataUrl.length > 200000) dataUrl = relayCanvas.toDataURL('image/jpeg', 0.28);
 
-    activeRelayClient.publish(frameTopic, dataUrl, { qos: 0 });
+    client.publish(frameTopic, dataUrl, { qos: 0 });
     lastFrameTime = Date.now();
   }
 
@@ -412,8 +440,7 @@ function startRelayCapture() {
     for (let i = 0; i < cur.length; i += 4) {
       diff += Math.abs(cur[i] - lastThumb[i]) + Math.abs(cur[i+1] - lastThumb[i+1]) + Math.abs(cur[i+2] - lastThumb[i+2]);
     }
-    const avg = diff / (32 * 18 * 3);
-    if (avg > 1.8) {
+    if (diff / (32 * 18 * 3) > 1.8) {
       lastThumb.set(cur);
       return true;
     }
@@ -427,11 +454,9 @@ function startRelayCapture() {
       sharpSent = false;
       sendFrame(false);
     } else if (!sharpSent && now - lastFrameTime > 600) {
-      // Screen settled: send one crisp frame for sharp slide/code text
       sharpSent = true;
       sendFrame(true);
-    } else if (now - lastFrameTime > 4500) {
-      // Periodic refresh in case board missed a frame
+    } else if (now - lastFrameTime > 4000) {
       sendFrame(true);
     }
     relayLoopTimer = setTimeout(tick, 240);
@@ -460,8 +485,8 @@ function stopShare(notify = true) {
   $('btnStop').disabled = true;
   if (notify) {
     if (conn && conn.open) conn.send({ type: 'stopped' });
-    if (activeRelayClient && activeRelayClient.connected && sessionCode) {
-      activeRelayClient.publish(TOPIC_BASE + sessionCode + '/ctrl', JSON.stringify({ type: 'stopped' }));
+    if (activeRelayEntry && activeRelayEntry.client.connected && sessionCode) {
+      activeRelayEntry.client.publish(TOPIC_BASE + sessionCode + '/to-board', JSON.stringify({ type: 'stopped' }));
     }
   }
 }
@@ -545,7 +570,7 @@ async function sharePDF(f) {
     pageCanvas = pc; pageNum = n;
     $('pageInfo').textContent = 'Page ' + n + ' / ' + pdf.numPages;
     draw();
-    lastThumb = null; sharpSent = false; // Force instant update on board
+    lastThumb = null; sharpSent = false;
   }
   const draw = () => { if (pageCanvas) drawContain(ctx, c, pageCanvas, pageCanvas.width, pageCanvas.height); };
   await render(1);
@@ -633,7 +658,7 @@ function joinViaDirectFirst() {
     try { peer && peer.destroy(); } catch (e) {}
     peer = conn = null;
     if (window.mqtt) {
-      $('err').textContent = reason + ' Switching to College Wi-Fi Relay (Port 443)…';
+      $('err').textContent = reason + ' Switching to College Wi-Fi Relay…';
       joinViaRelay();
     } else {
       $('err').textContent = 'Direct connection blocked and MQTT library unavailable.';
@@ -671,7 +696,6 @@ function joinViaDirectFirst() {
         $('waitText').textContent = 'Connected (HD). Waiting for the teacher to start sharing…';
         $('waiting').style.display = 'flex';
       } else if (d.type === 'sharing' && boardMode === 'direct') {
-        // If firewall allows DataChannel but blocks video stream, auto-switch to Relay
         clearTimeout(mediaFallbackTimer);
         mediaFallbackTimer = setTimeout(() => {
           if (boardMode === 'direct' && $('waiting').style.display !== 'none' && window.mqtt) {
@@ -727,58 +751,83 @@ $('btnSwitchRelay').onclick = e => {
 function joinViaRelay(alreadyInViewer = false) {
   if (!window.mqtt) { $('err').textContent = 'Relay library (MQTT) not loaded.'; return; }
   boardMode = 'relay';
-  if (!alreadyInViewer) $('err').textContent = 'Connecting via College Wi-Fi Relay (Port 443)…';
+  if (!alreadyInViewer) $('err').textContent = 'Connecting via College Wi-Fi Relay…';
 
-  const ctrlTopic = TOPIC_BASE + sessionCode + '/ctrl';
-  const frameTopic = TOPIC_BASE + sessionCode + '/frame';
+  const toHostTopic  = TOPIC_BASE + sessionCode + '/to-host';
+  const toBoardTopic = TOPIC_BASE + sessionCode + '/to-board';
+  const stateTopic   = TOPIC_BASE + sessionCode + '/state';
+  const frameTopic   = TOPIC_BASE + sessionCode + '/frame';
+
   let joined = false;
-  let connectedBrokers = 0;
+  const boardConnectedBrokers = new Set();
+
+  function sendJoinOnAll() {
+    if (joined) return;
+    mqttEntries.forEach(({ client }) => {
+      if (client && client.connected) {
+        try { client.publish(toHostTopic, JSON.stringify({ type: 'join' })); } catch (e) {}
+      }
+    });
+  }
+
+  joinRetryTimer = setInterval(sendJoinOnAll, 1500);
 
   const relayTimeout = setTimeout(() => {
     if (joined) return;
+    const reached = [...boardConnectedBrokers];
     closeAllMqtt(false);
-    const msg = connectedBrokers > 0
-      ? 'Session not found. Check the 6-digit code.'
-      : 'Could not reach relay servers. Check internet connection.';
+    const msg = reached.length > 0
+      ? 'Session not found on [' + reached.join(', ') + ']. Refresh the teacher laptop and confirm it shows one of those same relays ✔.'
+      : 'Could not reach any relay server (blocked by firewall or offline).';
     if (alreadyInViewer) { alert(msg); resetAll(); }
     else $('err').textContent = msg;
-  }, 8500);
+  }, 10000);
 
-  MQTT_BROKERS.forEach(url => {
+  MQTT_BROKERS.forEach(broker => {
     try {
-      const client = mqtt.connect(url, {
+      const client = mqtt.connect(broker.url, {
         clientId: 'cc_b_' + Math.random().toString(16).slice(2, 10),
         clean: true,
-        connectTimeout: 6000,
+        connectTimeout: 7000,
         reconnectPeriod: 3000
       });
-      mqttClients.push(client);
+      const entry = { name: broker.name, client };
+      mqttEntries.push(entry);
 
       client.on('connect', () => {
-        if (joined && client !== activeRelayClient) { client.end(true); return; }
-        connectedBrokers++;
-        client.subscribe([ctrlTopic, frameTopic], () => {
-          client.publish(ctrlTopic, JSON.stringify({ type: 'join' }));
+        if (joined && entry !== activeRelayEntry) { client.end(true); return; }
+        boardConnectedBrokers.add(broker.name);
+        if (!alreadyInViewer && !joined) {
+          $('err').textContent = 'Connected to ' + [...boardConnectedBrokers].join(', ') + '. Waiting for teacher…';
+        }
+        client.subscribe([toBoardTopic, frameTopic, stateTopic], () => {
+          client.publish(toHostTopic, JSON.stringify({ type: 'join' }));
         });
       });
 
       client.on('message', (topic, payload) => {
-        if (topic === ctrlTopic) {
+        if (topic === stateTopic && !joined) {
+          // Host beacon seen on this broker — immediately send join
+          client.publish(toHostTopic, JSON.stringify({ type: 'join' }));
+          return;
+        }
+        if (topic === toBoardTopic) {
           let msg;
-          try { msg = JSON.parse(new TextDecoder().decode(payload)); } catch (e) { return; }
+          try { msg = JSON.parse(decodePayload(payload)); } catch (e) { return; }
+
           if (msg.type === 'hello' && !joined) {
             joined = true;
             clearTimeout(relayTimeout);
-            activeRelayClient = client;
-            // Close other backup broker connections
-            mqttClients.forEach(c => { if (c !== client) { try { c.end(true); } catch (e) {} } });
-            mqttClients = [client];
+            clearInterval(joinRetryTimer);
+            activeRelayEntry = entry;
+            mqttEntries.forEach(e => { if (e !== entry) { try { e.client.end(true); } catch (_) {} } });
+            mqttEntries = [entry];
             $('err').textContent = '';
-            enterViewer('relay');
-          } else if (msg.type === 'stopped' && client === activeRelayClient) {
-            $('waitText').textContent = 'Connected (College Relay). Waiting for the teacher to start sharing…';
+            enterViewer('relay', broker.name);
+          } else if (msg.type === 'stopped' && entry === activeRelayEntry) {
+            $('waitText').textContent = 'Connected (' + broker.name + '). Waiting for the teacher to start sharing…';
             $('waiting').style.display = 'flex';
-          } else if (msg.type === 'end' && client === activeRelayClient) {
+          } else if (msg.type === 'end' && entry === activeRelayEntry) {
             alert('The teacher ended the session.');
             resetAll();
           }
@@ -786,13 +835,14 @@ function joinViaRelay(alreadyInViewer = false) {
           if (!joined) {
             joined = true;
             clearTimeout(relayTimeout);
-            activeRelayClient = client;
-            mqttClients.forEach(c => { if (c !== client) { try { c.end(true); } catch (e) {} } });
-            mqttClients = [client];
-            enterViewer('relay');
+            clearInterval(joinRetryTimer);
+            activeRelayEntry = entry;
+            mqttEntries.forEach(e => { if (e !== entry) { try { e.client.end(true); } catch (_) {} } });
+            mqttEntries = [entry];
+            enterViewer('relay', broker.name);
           }
-          if (client !== activeRelayClient) return;
-          const dataUrl = new TextDecoder().decode(payload);
+          if (entry !== activeRelayEntry) return;
+          const dataUrl = decodePayload(payload);
           if (dataUrl.startsWith('data:image/')) {
             $('remote').style.display = 'none';
             $('remoteImg').style.display = 'block';
@@ -802,17 +852,17 @@ function joinViaRelay(alreadyInViewer = false) {
         }
       });
     } catch (e) {
-      console.warn('MQTT board error:', url, e);
+      console.warn('MQTT board error:', broker.name, e);
     }
   });
 }
 
 let hideTimer = null;
-function enterViewer(mode) {
+function enterViewer(mode, relayName = 'College Relay') {
   show('viewer');
   $('waiting').style.display = 'flex';
   if (mode === 'relay') {
-    $('waitText').textContent = 'Connected (College Wi-Fi Relay). Waiting for the teacher to start sharing…';
+    $('waitText').textContent = 'Connected (' + relayName + '). Waiting for the teacher to start sharing…';
     $('btnMute').style.display = 'none';
     $('btnSwitchRelay').style.display = 'none';
   } else {
@@ -855,8 +905,8 @@ document.addEventListener('fullscreenchange', updateFullBtn);
 
 $('btnLeave').onclick = e => {
   e.stopPropagation();
-  if (activeRelayClient && activeRelayClient.connected && sessionCode) {
-    try { activeRelayClient.publish(TOPIC_BASE + sessionCode + '/ctrl', JSON.stringify({ type: 'leave' })); } catch (_) {}
+  if (activeRelayEntry && activeRelayEntry.client.connected && sessionCode) {
+    try { activeRelayEntry.client.publish(TOPIC_BASE + sessionCode + '/to-host', JSON.stringify({ type: 'leave' })); } catch (_) {}
   }
   resetAll();
 };
