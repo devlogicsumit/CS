@@ -101,11 +101,11 @@
   <div class="status" id="tStatus">Starting…</div>
   <div class="badge" id="tNetInfo">Initializing channels…</div>
 
-  <!-- Relay Speed / Quality Selector -->
-  <div class="presets" id="presetBar" title="Controls Relay Mode speed vs sharpness">
-    <button class="preset active" data-mode="auto">⚡ Auto (Balanced)</button>
-    <button class="preset" data-mode="video">🎞️ Fast / Video</button>
-    <button class="preset" data-mode="slides">📄 Sharp Slides</button>
+  <!-- Relay Bitrate / Quality Selector -->
+  <div class="presets" id="presetBar" title="Controls Relay stream bitrate & smoothness">
+    <button class="preset active" data-mode="auto">⚡ Balanced (900 kbps)</button>
+    <button class="preset" data-mode="fast">🚀 Ultra-Fast (500 kbps)</button>
+    <button class="preset" data-mode="sharp">📄 Sharp HD (1.6 Mbps)</button>
   </div>
 
   <div class="row">
@@ -157,7 +157,7 @@
 <script>window.Peer || document.write('<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"><\/script>')</script>
 <script>window.Peer || document.write('<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"><\/script>')</script>
 
-<!-- MQTT.js 5.14+: native binary Uint8Array support in browser -->
+<!-- MQTT.js 5.x: native binary Uint8Array support in browser -->
 <script src="mqtt.min.js"></script>
 <script>window.mqtt || document.write('<script src="https://unpkg.com/mqtt@5.14.1/dist/mqtt.min.js"><\/script>')</script>
 <script>window.mqtt || document.write('<script src="https://cdn.jsdelivr.net/npm/mqtt@5.14.1/dist/mqtt.min.js"><\/script>')</script>
@@ -169,7 +169,7 @@
 
 <script>
 const PREFIX = 'classcast-v1-';
-const TOPIC_BASE = 'classcast/v4/';
+const TOPIC_BASE = 'classcast/v5/';
 
 const MQTT_BROKERS = [
   { name: 'Eclipse-443', url: 'wss://mqtt.eclipseprojects.io:443/mqtt' },
@@ -178,13 +178,25 @@ const MQTT_BROKERS = [
   { name: 'Mosq-8081',   url: 'wss://test.mosquitto.org:8081' }
 ];
 
+// Candidate codecs for live 25–30 FPS MediaRecorder -> MSE streaming
+const VIDEO_AUDIO_CODECS = [
+  'video/webm;codecs=vp8,opus',
+  'video/webm;codecs=vp9,opus',
+  'video/webm;codecs=h264,opus'
+];
+const VIDEO_ONLY_CODECS = [
+  'video/webm;codecs=vp8',
+  'video/webm;codecs=vp9',
+  'video/webm;codecs=h264'
+];
+
 const $ = id => document.getElementById(id);
+const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 function decodePayload(p) {
   return typeof p === 'string' ? p : decoder.decode(p);
 }
 
-// Detect WebP encoding support (~35% smaller & faster than JPEG)
 const CAN_WEBP = (() => {
   try {
     const c = document.createElement('canvas');
@@ -192,6 +204,14 @@ const CAN_WEBP = (() => {
     return c.toDataURL('image/webp').startsWith('data:image/webp');
   } catch (e) { return false; }
 })();
+
+function getSupportedMseCodecs() {
+  if (typeof MediaSource === 'undefined' || !MediaSource.isTypeSupported) return [];
+  const all = [...VIDEO_AUDIO_CODECS, ...VIDEO_ONLY_CODECS];
+  return all.filter(c => {
+    try { return MediaSource.isTypeSupported(c); } catch (e) { return false; }
+  });
+}
 
 if (!window.Peer && !window.mqtt) {
   $('libWarn').style.display = 'block';
@@ -209,31 +229,60 @@ let stream = null, fileCleanup = null;
 let mqttEntries = []; // { name, client }
 let activeRelayEntry = null;
 let relayConnected = false;
-let boardSupportsWebP = false;
-let relayPreset = 'auto'; // 'auto' | 'video' | 'slides'
-let relayLoopTimer = null;
+let boardCaps = { webp: false, mse: [] };
+let forceImgFallback = false;
+let relayPreset = 'auto'; // 'auto' | 'fast' | 'sharp'
 let joinRetryTimer = null;
+
+// Teacher MSE MediaRecorder state (primary — 25-30 FPS smooth video!)
+let mediaRecorder = null;
+let streamGen = 0;
+let chunkSendChain = Promise.resolve();
+let bytesThisSec = 0, lastRateTick = 0, liveKbps = 0;
+let activeStreamMode = ''; // 'MSE' | 'IMG'
+
+// Teacher Fallback Image-Frame state (only if smart board lacks MSE)
+let relayLoopTimer = null;
 let relayVideoEl = null;
 let relayCanvas = null, relayCtx = null;
 let diffCanvas = null, diffCtx = null, lastThumb = null;
-let lastFrameTime = 0, sharpSent = false;
-let isEncoding = false;
+let lastFrameTime = 0, sharpSent = false, isEncoding = false;
 
-// Flow control & live telemetry (eliminates latency buildup)
-let frameSeq = 0;
-let inFlight = new Map(); // seq -> sentTimestamp
-let smoothRtt = 180;      // rolling RTT estimate (ms)
-let sentFramesInSec = 0, lastFpsTick = 0, liveFps = 0, lastKb = 0;
-
-// Board rendering state (zero-lag frame dropping)
+// Board MSE playback state
 let boardMode = 'relay'; // 'direct' | 'relay'
 let mediaFallbackTimer = null;
+let mseSource = null, mseUrl = null, mseBuffer = null;
+let mseQueue = [];
+let activeMseGen = -1;
+let mseSyncTimer = null;
+
+// Board Fallback Canvas state
 let boardDecoding = false;
 let pendingFrameBlob = null;
 
 function show(id) {
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
   $(id).classList.add('active');
+}
+
+function teardownBoardMse() {
+  clearInterval(mseSyncTimer);
+  mseSyncTimer = null;
+  mseQueue = [];
+  activeMseGen = -1;
+  if (mseBuffer) {
+    try { mseBuffer.onupdateend = null; mseBuffer.onerror = null; } catch (e) {}
+    mseBuffer = null;
+  }
+  if (mseSource) {
+    try { if (mseSource.readyState === 'open') mseSource.endOfStream(); } catch (e) {}
+    mseSource = null;
+  }
+  const v = $('remote');
+  v.pause();
+  v.removeAttribute('src');
+  v.srcObject = null;
+  if (mseUrl) { URL.revokeObjectURL(mseUrl); mseUrl = null; }
 }
 
 function closeAllMqtt(sendEnd = false) {
@@ -253,12 +302,12 @@ function closeAllMqtt(sendEnd = false) {
   mqttEntries = [];
   activeRelayEntry = null;
   relayConnected = false;
-  inFlight.clear();
 }
 
 function resetAll() {
   const wasTeacher = role === 'teacher';
   stopShare(false);
+  teardownBoardMse();
   clearTimeout(mediaFallbackTimer);
   closeAllMqtt(wasTeacher);
   try { call && call.close(); } catch (e) {}
@@ -267,10 +316,10 @@ function resetAll() {
   peer = conn = call = null;
   role = null;
   sessionCode = '';
+  forceImgFallback = false;
   pendingFrameBlob = null;
   boardDecoding = false;
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-  $('remote').srcObject = null;
   $('remote').style.display = 'block';
   $('remoteCanvas').style.display = 'none';
   $('btnSwitchRelay').style.display = 'none';
@@ -281,14 +330,13 @@ window.addEventListener('beforeunload', () => {
   if (role === 'teacher') closeAllMqtt(true);
 });
 
-/* ===== Teacher Preset Toggle ===== */
+/* ===== Teacher Bitrate Preset Toggle ===== */
 document.querySelectorAll('.preset').forEach(btn => {
   btn.onclick = () => {
     document.querySelectorAll('.preset').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     relayPreset = btn.dataset.mode;
-    lastThumb = null;
-    sharpSent = false;
+    if (stream && relayConnected) startRelayStream();
   };
 });
 
@@ -304,9 +352,9 @@ let connectedBrokerNames = new Set();
 
 function updateTeacherBadge() {
   if (relayConnected && stream) {
-    const fmt = (CAN_WEBP && boardSupportsWebP) ? 'WebP' : 'JPEG';
+    const label = activeStreamMode === 'MSE' ? 'Live Video (25–30 FPS)' : 'Compat Frames';
     $('tNetInfo').textContent =
-      `Relay (${activeRelayEntry.name}) • ${fmt} • ${liveFps} FPS • ${Math.round(smoothRtt)} ms • ${lastKb} KB/frame`;
+      `Relay (${activeRelayEntry.name}) • ${label} • ${liveKbps} kbps`;
     return;
   }
   const parts = [];
@@ -326,6 +374,7 @@ function updateTeacherBadge() {
 function startSession() {
   sessionCode = genCode();
   peerReady = false;
+  forceImgFallback = false;
   connectedBrokerNames = new Set();
   $('code').textContent = '······';
   setStatus('Creating session…');
@@ -348,8 +397,6 @@ function startSession() {
         try { peer.destroy(); } catch (_) {}
         closeAllMqtt(false);
         startSession();
-      } else {
-        console.warn('PeerJS error:', e.type);
       }
     });
     peer.on('disconnected', () => { try { peer.reconnect(); } catch (e) {} });
@@ -366,7 +413,7 @@ function startSession() {
     });
   }
 
-  // 2. MQTT Relay (multi-broker with Port 443 primary)
+  // 2. MQTT Relay (Port 443 primary)
   if (window.mqtt) {
     const toHostTopic  = TOPIC_BASE + sessionCode + '/to-host';
     const toBoardTopic = TOPIC_BASE + sessionCode + '/to-board';
@@ -396,32 +443,25 @@ function startSession() {
           let msg;
           try { msg = JSON.parse(decodePayload(payload)); } catch (e) { return; }
 
-          if (msg.type === 'ack') {
-            const sentAt = inFlight.get(msg.seq);
-            if (sentAt !== undefined) {
-              const rtt = Math.max(20, Math.min(2000, Date.now() - sentAt));
-              smoothRtt = smoothRtt * 0.72 + rtt * 0.28;
-              inFlight.delete(msg.seq);
-            }
-            return;
-          }
-
           if (msg.type === 'join') {
             activeRelayEntry = entry;
             relayConnected = true;
-            boardSupportsWebP = !!msg.webp;
-            inFlight.clear();
+            boardCaps = { webp: !!msg.webp, mse: Array.isArray(msg.mse) ? msg.mse : [] };
+            forceImgFallback = false;
             client.publish(toBoardTopic, JSON.stringify({ type: 'hello', sharing: !!stream }));
             setStatus('Board connected (' + broker.name + ' Relay) ✔', true);
             updateTeacherBadge();
-            if (stream) {
-              lastThumb = null;
-              sharpSent = false;
-              startRelayCapture();
-            }
+            if (stream) startRelayStream();
+          } else if (msg.type === 'need-reset') {
+            // Board requested a fresh keyframe/init segment
+            if (stream && relayConnected) startRelayStream();
+          } else if (msg.type === 'fallback-img') {
+            // Smart board MSE errored — switch cleanly to image frames
+            forceImgFallback = true;
+            if (stream && relayConnected) startRelayStream();
           } else if (msg.type === 'leave') {
             relayConnected = false;
-            stopRelayCapture();
+            stopRelayStream();
             updateTeacherBadge();
             if (!conn || !conn.open) setStatus('Board disconnected. Waiting for it to connect again…');
           }
@@ -446,22 +486,131 @@ function callBoard() {
   call = peer.call(conn.peer, stream);
 }
 
-/* ===== Teacher Low-Latency Binary WebP Capture with ACK Flow Control ===== */
-function stopRelayCapture() {
+/* ===== Teacher Relay Streamer (Primary: Live VP8/H.264 Video via MediaRecorder) ===== */
+function stopRelayStream() {
+  if (mediaRecorder) {
+    try {
+      mediaRecorder.ondataavailable = null;
+      if (mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+    } catch (e) {}
+    mediaRecorder = null;
+  }
   if (relayLoopTimer) { clearTimeout(relayLoopTimer); relayLoopTimer = null; }
   if (relayVideoEl) { relayVideoEl.pause(); relayVideoEl.srcObject = null; relayVideoEl = null; }
   lastThumb = null;
   sharpSent = false;
   isEncoding = false;
-  inFlight.clear();
-  liveFps = 0;
+  liveKbps = 0;
+  activeStreamMode = '';
   updateTeacherBadge();
 }
 
-function startRelayCapture() {
-  stopRelayCapture();
+function pickSharedVideoCodec(hasAudio) {
+  if (forceImgFallback || typeof MediaRecorder === 'undefined' || !boardCaps.mse.length) return null;
+  const list = hasAudio ? VIDEO_AUDIO_CODECS : VIDEO_ONLY_CODECS;
+  for (const mime of list) {
+    if (boardCaps.mse.includes(mime) && MediaRecorder.isTypeSupported(mime)) return mime;
+  }
+  // If audio codec mismatch, try video-only so video still streams smoothly
+  if (hasAudio) {
+    for (const mime of VIDEO_ONLY_CODECS) {
+      if (boardCaps.mse.includes(mime) && MediaRecorder.isTypeSupported(mime)) return mime;
+    }
+  }
+  return null;
+}
+
+function startRelayStream() {
+  stopRelayStream();
   if (!stream || !relayConnected || !activeRelayEntry) return;
 
+  const hasAudio = stream.getAudioTracks().length > 0;
+  const chosenMime = pickSharedVideoCodec(hasAudio);
+
+  if (chosenMime) {
+    startMseRelay(chosenMime, hasAudio);
+  } else {
+    startImageFallbackRelay();
+  }
+}
+
+function startMseRelay(mime, hasAudio) {
+  const client = activeRelayEntry && activeRelayEntry.client;
+  if (!client || !client.connected) return;
+
+  activeStreamMode = 'MSE';
+  streamGen = (streamGen + 1) & 255;
+  const myGen = streamGen;
+  const frameTopic = TOPIC_BASE + sessionCode + '/frame';
+
+  // Build stream matching codec (strip audio track if using a video-only codec)
+  const includeAudio = hasAudio && mime.includes('opus');
+  const recordStream = includeAudio
+    ? stream
+    : new MediaStream(stream.getVideoTracks());
+
+  const videoBitrate =
+    relayPreset === 'fast'  ? 500000 :
+    relayPreset === 'sharp' ? 1600000 : 900000;
+
+  // Send MSE Stream Start packet (0x04) on the SAME topic so strict FIFO order is guaranteed
+  const metaBytes = encoder.encode(JSON.stringify({ mime, audio: includeAudio }));
+  const initPkt = new Uint8Array(metaBytes.length + 2);
+  initPkt[0] = 4;
+  initPkt[1] = myGen;
+  initPkt.set(metaBytes, 2);
+  client.publish(frameTopic, initPkt, { qos: 0 });
+
+  try {
+    mediaRecorder = new MediaRecorder(recordStream, {
+      mimeType: mime,
+      videoBitsPerSecond: videoBitrate,
+      audioBitsPerSecond: includeAudio ? 48000 : undefined
+    });
+  } catch (e) {
+    console.warn('MediaRecorder failed, falling back to image frames:', e);
+    forceImgFallback = true;
+    startImageFallbackRelay();
+    return;
+  }
+
+  bytesThisSec = 0;
+  lastRateTick = Date.now();
+  chunkSendChain = Promise.resolve();
+
+  mediaRecorder.ondataavailable = e => {
+    if (!e.data || e.data.size === 0) return;
+    const blob = e.data;
+    // Chain promises so chunks are ALWAYS published in exact sequence
+    chunkSendChain = chunkSendChain.then(async () => {
+      if (myGen !== streamGen || !relayConnected || !activeRelayEntry || !activeRelayEntry.client.connected) return;
+      const ab = await blob.arrayBuffer();
+      const bytes = new Uint8Array(ab);
+      const pkt = new Uint8Array(bytes.length + 2);
+      pkt[0] = 3; // MSE binary video chunk
+      pkt[1] = myGen;
+      pkt.set(bytes, 2);
+      activeRelayEntry.client.publish(frameTopic, pkt, { qos: 0 });
+
+      bytesThisSec += pkt.length;
+      const now = Date.now();
+      if (now - lastRateTick >= 1000) {
+        liveKbps = Math.round((bytesThisSec * 8) / (now - lastRateTick));
+        bytesThisSec = 0;
+        lastRateTick = now;
+        updateTeacherBadge();
+      }
+    }).catch(err => console.warn('Chunk send error:', err));
+  };
+
+  // 100ms chunks = ultra-low latency + smooth 25–30 FPS video
+  mediaRecorder.start(100);
+  updateTeacherBadge();
+}
+
+/* ===== Fallback: Binary WebP/JPEG Frames (only if smart board lacks MSE) ===== */
+function startImageFallbackRelay() {
+  activeStreamMode = 'IMG';
   relayVideoEl = document.createElement('video');
   relayVideoEl.muted = true;
   relayVideoEl.playsInline = true;
@@ -477,37 +626,11 @@ function startRelayCapture() {
   }
 
   const frameTopic = TOPIC_BASE + sessionCode + '/frame';
-  const useWebP = CAN_WEBP && boardSupportsWebP;
+  const useWebP = CAN_WEBP && boardCaps.webp;
   const mime = useWebP ? 'image/webp' : 'image/jpeg';
   const fmtByte = useWebP ? 1 : 2;
-  lastFpsTick = Date.now();
-  sentFramesInSec = 0;
-
-  function getEncodeProfile(highRes) {
-    if (highRes) {
-      if (relayPreset === 'video') return { maxW: 1152, quality: 0.68 };
-      return { maxW: 1440, quality: 0.78 };
-    }
-    if (relayPreset === 'video') {
-      if (smoothRtt < 220) return { maxW: 854, quality: 0.48 };
-      if (smoothRtt < 420) return { maxW: 720, quality: 0.40 };
-      return { maxW: 576, quality: 0.34 };
-    }
-    if (relayPreset === 'slides') {
-      return { maxW: smoothRtt < 350 ? 1152 : 960, quality: 0.62 };
-    }
-    // Auto (balanced): dynamically adapts to college Wi-Fi ping
-    if (smoothRtt < 180) return { maxW: 960, quality: 0.54 };
-    if (smoothRtt < 340) return { maxW: 800, quality: 0.46 };
-    return { maxW: 640, quality: 0.38 };
-  }
-
-  function pruneStaleInFlight(now) {
-    // Expire un-ACKed QoS-0 packets after 900ms so stream never stalls
-    for (const [seq, ts] of inFlight.entries()) {
-      if (now - ts > 900) inFlight.delete(seq);
-    }
-  }
+  bytesThisSec = 0;
+  lastRateTick = Date.now();
 
   function hasChanged() {
     if (!relayVideoEl || relayVideoEl.readyState < 2) return false;
@@ -516,93 +639,58 @@ function startRelayCapture() {
     if (!lastThumb) { lastThumb = new Uint8ClampedArray(cur); return true; }
     let diff = 0;
     for (let i = 0; i < cur.length; i += 4) {
-      diff += Math.abs(cur[i] - lastThumb[i]) +
-              Math.abs(cur[i+1] - lastThumb[i+1]) +
-              Math.abs(cur[i+2] - lastThumb[i+2]);
+      diff += Math.abs(cur[i] - lastThumb[i]) + Math.abs(cur[i+1] - lastThumb[i+1]) + Math.abs(cur[i+2] - lastThumb[i+2]);
     }
-    const threshold = relayPreset === 'video' ? 1.0 : 1.5;
-    if (diff / (48 * 27 * 3) > threshold) {
-      lastThumb.set(cur);
-      return true;
-    }
+    if (diff / (48 * 27 * 3) > 1.5) { lastThumb.set(cur); return true; }
     return false;
   }
 
   function encodeAndSend(highRes) {
     const client = activeRelayEntry && activeRelayEntry.client;
     if (isEncoding || !relayVideoEl || relayVideoEl.readyState < 2 || !client || !client.connected) return;
-
     isEncoding = true;
     const vw = relayVideoEl.videoWidth || 1280;
     const vh = relayVideoEl.videoHeight || 720;
-    const { maxW, quality } = getEncodeProfile(highRes);
+    const maxW = highRes ? 1280 : (relayPreset === 'fast' ? 640 : 854);
     const scale = Math.min(1, maxW / vw);
     const w = Math.max(2, Math.round(vw * scale));
     const h = Math.max(2, Math.round(vh * scale));
-
     if (relayCanvas.width !== w || relayCanvas.height !== h) {
       relayCanvas.width = w; relayCanvas.height = h;
     }
     relayCtx.drawImage(relayVideoEl, 0, 0, w, h);
-
     relayCanvas.toBlob(async blob => {
       try {
         if (!blob || !stream || !relayConnected || !client.connected) return;
-        const ab = await blob.arrayBuffer();
-        const bytes = new Uint8Array(ab);
-        const seq = (frameSeq = (frameSeq + 1) & 255);
-
-        // 2-byte binary header: [format, seq] + raw WebP/JPEG bytes
-        const packet = new Uint8Array(bytes.length + 2);
-        packet[0] = fmtByte;
-        packet[1] = seq;
-        packet.set(bytes, 2);
-
-        inFlight.set(seq, Date.now());
-        client.publish(frameTopic, packet, { qos: 0 });
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        const pkt = new Uint8Array(bytes.length + 2);
+        pkt[0] = fmtByte;
+        pkt[1] = 0;
+        pkt.set(bytes, 2);
+        client.publish(frameTopic, pkt, { qos: 0 });
         lastFrameTime = Date.now();
-        lastKb = Math.round(packet.length / 1024);
-        sentFramesInSec++;
-
-        if (lastFrameTime - lastFpsTick >= 1000) {
-          liveFps = sentFramesInSec;
-          sentFramesInSec = 0;
-          lastFpsTick = lastFrameTime;
+        bytesThisSec += pkt.length;
+        if (lastFrameTime - lastRateTick >= 1000) {
+          liveKbps = Math.round((bytesThisSec * 8) / (lastFrameTime - lastRateTick));
+          bytesThisSec = 0; lastRateTick = lastFrameTime;
           updateTeacherBadge();
         }
-      } catch (e) {
-        console.warn('Frame encode/send error:', e);
-      } finally {
-        isEncoding = false;
-      }
-    }, mime, quality);
+      } finally { isEncoding = false; }
+    }, mime, highRes ? 0.72 : 0.45);
   }
 
   function tick() {
-    if (!stream || !relayConnected) return;
+    if (!stream || !relayConnected || activeStreamMode !== 'IMG') return;
     const now = Date.now();
-    pruneStaleInFlight(now);
-
-    const maxInFlight = relayPreset === 'slides' ? 1 : 2;
-    const minInterval = relayPreset === 'video' ? 55 : (relayPreset === 'slides' ? 160 : 70);
-
-    if (!isEncoding && inFlight.size < maxInFlight && (now - lastFrameTime >= minInterval)) {
-      if (hasChanged()) {
-        sharpSent = false;
-        encodeAndSend(false);
-      } else if (!sharpSent && now - lastFrameTime > 480 && inFlight.size === 0) {
-        // Screen paused: send one crisp HD frame for razor-sharp text
-        sharpSent = true;
-        encodeAndSend(true);
-      } else if (now - lastFrameTime > 5000 && inFlight.size === 0) {
-        encodeAndSend(true);
-      }
+    if (!isEncoding && now - lastFrameTime >= 110) {
+      if (hasChanged()) { sharpSent = false; encodeAndSend(false); }
+      else if (!sharpSent && now - lastFrameTime > 500) { sharpSent = true; encodeAndSend(true); }
+      else if (now - lastFrameTime > 4500) { encodeAndSend(true); }
     }
-
-    relayLoopTimer = setTimeout(tick, 35);
+    relayLoopTimer = setTimeout(tick, 45);
   }
-
-  relayLoopTimer = setTimeout(tick, 60);
+  relayLoopTimer = setTimeout(tick, 80);
+  updateTeacherBadge();
 }
 
 function setStream(s) {
@@ -610,11 +698,11 @@ function setStream(s) {
   stream = s;
   $('btnStop').disabled = false;
   callBoard();
-  if (relayConnected) startRelayCapture();
+  if (relayConnected) startRelayStream();
 }
 
 function stopShare(notify = true) {
-  stopRelayCapture();
+  stopRelayStream();
   if (fileCleanup) { fileCleanup(); fileCleanup = null; }
   if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
   try { call && call.close(); } catch (e) {}
@@ -640,11 +728,11 @@ function showPreview(el) {
 $('btnScreen').onclick = async () => {
   try {
     const s = await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: { ideal: 30, max: 30 } },
+      video: { width: { ideal: 1280, max: 1920 }, height: { ideal: 720, max: 1080 }, frameRate: { ideal: 25, max: 30 } },
       audio: true
     });
     const vt = s.getVideoTracks()[0];
-    if (vt && 'contentHint' in vt) vt.contentHint = 'detail';
+    if (vt && 'contentHint' in vt) vt.contentHint = 'motion';
     vt.onended = () => stopShare(true);
     setStream(s);
     const v = document.createElement('video');
@@ -670,7 +758,7 @@ $('fileInput').onchange = async e => {
 
 function makeCanvasStream() {
   const c = document.createElement('canvas');
-  c.width = 1920; c.height = 1080;
+  c.width = 1280; c.height = 720;
   return { c, ctx: c.getContext('2d') };
 }
 function drawContain(ctx, c, src, sw, sh) {
@@ -687,7 +775,7 @@ async function shareImage(f) {
   const draw = () => drawContain(ctx, c, img, img.naturalWidth, img.naturalHeight);
   draw();
   const timer = setInterval(draw, 500);
-  setStream(c.captureStream(15));
+  setStream(c.captureStream(10));
   fileCleanup = () => { clearInterval(timer); URL.revokeObjectURL(url); };
   showPreview(c);
 }
@@ -701,7 +789,7 @@ async function sharePDF(f) {
   let pageNum = 1, pageCanvas = null;
   async function render(n) {
     const page = await pdf.getPage(n);
-    const vp = page.getViewport({ scale: 2.5 });
+    const vp = page.getViewport({ scale: 2.2 });
     const pc = document.createElement('canvas');
     pc.width = vp.width; pc.height = vp.height;
     const pctx = pc.getContext('2d');
@@ -715,7 +803,7 @@ async function sharePDF(f) {
   const draw = () => { if (pageCanvas) drawContain(ctx, c, pageCanvas, pageCanvas.width, pageCanvas.height); };
   await render(1);
   const timer = setInterval(draw, 500);
-  setStream(c.captureStream(15));
+  setStream(c.captureStream(10));
   $('pager').style.display = 'flex';
   $('prevPage').onclick = () => { if (pageNum > 1) render(pageNum - 1); };
   $('nextPage').onclick = () => { if (pageNum < pdf.numPages) render(pageNum + 1); };
@@ -771,26 +859,115 @@ document.addEventListener('keydown', ev => {
 });
 $('btnJoin').onclick = join;
 
-/* ======================= BOARD: JOIN + RENDER ======================= */
-function renderBoardFrame(blob) {
-  if (boardDecoding) {
-    // Drop older queued frame so board always shows the latest screen state
-    pendingFrameBlob = blob;
+/* ======================= BOARD: MSE LIVE VIDEO PLAYER ======================= */
+function initBoardMse(gen, mime, hasAudio) {
+  teardownBoardMse();
+  activeMseGen = gen;
+
+  const v = $('remote');
+  v.muted = true;
+  v.playbackRate = 1.0;
+  v.style.display = 'block';
+  $('remoteCanvas').style.display = 'none';
+  $('btnMute').textContent = '🔇 Unmute';
+  $('btnMute').style.display = hasAudio ? 'inline-block' : 'none';
+
+  try {
+    mseSource = new MediaSource();
+    mseUrl = URL.createObjectURL(mseSource);
+    v.src = mseUrl;
+  } catch (e) {
+    requestImgFallback();
     return;
   }
+
+  mseSource.addEventListener('sourceopen', () => {
+    if (activeMseGen !== gen) return;
+    try {
+      mseBuffer = mseSource.addSourceBuffer(mime);
+      mseBuffer.mode = 'segments';
+      mseBuffer.onupdateend = () => {
+        trimMseBuffer(v);
+        drainMseQueue();
+      };
+      mseBuffer.onerror = () => requestImgFallback();
+      drainMseQueue();
+    } catch (e) {
+      requestImgFallback();
+    }
+  }, { once: true });
+
+  // Live-edge latency sync: keeps playback tight (~150-350ms behind live edge)
+  mseSyncTimer = setInterval(() => {
+    if (!v.buffered || v.buffered.length === 0) return;
+    const end = v.buffered.end(v.buffered.length - 1);
+    const lag = end - v.currentTime;
+    if (v.paused && lag > 0.05) {
+      v.play().catch(() => {});
+    }
+    if (lag > 0.55) {
+      v.currentTime = Math.max(0, end - 0.12);
+      v.playbackRate = 1.0;
+    } else if (lag > 0.24) {
+      v.playbackRate = 1.15;
+    } else {
+      v.playbackRate = 1.0;
+    }
+  }, 200);
+}
+
+function trimMseBuffer(v) {
+  if (!mseBuffer || mseBuffer.updating || !v.buffered || v.buffered.length === 0) return;
+  const start = v.buffered.start(0);
+  if (v.currentTime - start > 6) {
+    try { mseBuffer.remove(start, v.currentTime - 3); } catch (e) {}
+  }
+}
+
+function drainMseQueue() {
+  if (!mseBuffer || mseBuffer.updating || mseQueue.length === 0) return;
+  if (!mseSource || mseSource.readyState !== 'open') return;
+  const chunk = mseQueue.shift();
+  try {
+    mseBuffer.appendBuffer(chunk);
+    const v = $('remote');
+    if ($('waiting').style.display !== 'none') {
+      $('waiting').style.display = 'none';
+      v.play().catch(() => {});
+    }
+  } catch (e) {
+    if (e.name === 'QuotaExceededError') {
+      const v = $('remote');
+      mseQueue.unshift(chunk);
+      if (v.buffered && v.buffered.length > 0 && !mseBuffer.updating) {
+        try { mseBuffer.remove(v.buffered.start(0), Math.max(v.buffered.start(0), v.currentTime - 1)); } catch (_) {}
+      }
+    } else {
+      console.warn('MSE append error, requesting reset:', e);
+      if (activeRelayEntry && activeRelayEntry.client.connected) {
+        activeRelayEntry.client.publish(TOPIC_BASE + sessionCode + '/to-host', JSON.stringify({ type: 'need-reset' }));
+      }
+    }
+  }
+}
+
+function requestImgFallback() {
+  teardownBoardMse();
+  if (activeRelayEntry && activeRelayEntry.client.connected && sessionCode) {
+    activeRelayEntry.client.publish(TOPIC_BASE + sessionCode + '/to-host', JSON.stringify({ type: 'fallback-img' }));
+  }
+}
+
+/* ===== Board Fallback Image-Frame Renderer ===== */
+function renderBoardFrame(blob) {
+  if (boardDecoding) { pendingFrameBlob = blob; return; }
   boardDecoding = true;
   const canvas = $('remoteCanvas');
   const ctx = canvas.getContext('2d', { alpha: false });
-
   const finish = () => {
     boardDecoding = false;
-    if (pendingFrameBlob) {
-      const next = pendingFrameBlob;
-      pendingFrameBlob = null;
-      renderBoardFrame(next);
-    }
+    if (pendingFrameBlob) { const next = pendingFrameBlob; pendingFrameBlob = null; renderBoardFrame(next); }
   };
-
   if (typeof createImageBitmap === 'function') {
     createImageBitmap(blob).then(bmp => {
       if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
@@ -822,18 +999,17 @@ function renderBoardFrame(blob) {
   }
 }
 
+/* ======================= BOARD: JOIN ======================= */
 function join() {
   if (entered.length !== 6) { $('err').textContent = 'Please enter all 6 digits.'; return; }
   sessionCode = entered;
   try { peer && peer.destroy(); } catch (e) {}
   closeAllMqtt(false);
+  teardownBoardMse();
 
   const forceRelay = $('chkRelay').checked || !window.Peer;
-  if (forceRelay) {
-    joinViaRelay();
-  } else {
-    joinViaDirectFirst();
-  }
+  if (forceRelay) joinViaRelay();
+  else joinViaDirectFirst();
 }
 
 function joinViaDirectFirst() {
@@ -908,6 +1084,7 @@ function joinViaDirectFirst() {
       v.srcObject = s;
       v.muted = true;
       $('btnMute').textContent = '🔇 Unmute';
+      $('btnMute').style.display = 'inline-block';
       v.style.display = 'block';
       $('remoteCanvas').style.display = 'none';
       v.play().catch(() => {});
@@ -929,7 +1106,6 @@ function upgradeViewerToRelay() {
   $('waitText').textContent = 'Switching to College Wi-Fi Relay (Port 443)…';
   $('waiting').style.display = 'flex';
   $('btnSwitchRelay').style.display = 'none';
-  $('btnMute').style.display = 'none';
   joinViaRelay(true);
 }
 
@@ -950,7 +1126,11 @@ function joinViaRelay(alreadyInViewer = false) {
 
   let joined = false;
   const boardConnectedBrokers = new Set();
-  const joinPayload = JSON.stringify({ type: 'join', webp: CAN_WEBP });
+  const joinPayload = JSON.stringify({
+    type: 'join',
+    webp: CAN_WEBP,
+    mse: getSupportedMseCodecs()
+  });
 
   function sendJoinOnAll() {
     if (joined) return;
@@ -1015,6 +1195,7 @@ function joinViaRelay(alreadyInViewer = false) {
             $('err').textContent = '';
             enterViewer('relay', broker.name);
           } else if (msg.type === 'stopped' && entry === activeRelayEntry) {
+            teardownBoardMse();
             $('waitText').textContent = 'Connected (' + broker.name + '). Waiting for the teacher to start sharing…';
             $('waiting').style.display = 'flex';
           } else if (msg.type === 'end' && entry === activeRelayEntry) {
@@ -1031,16 +1212,25 @@ function joinViaRelay(alreadyInViewer = false) {
             mqttEntries = [entry];
             enterViewer('relay', broker.name);
           }
-          if (entry !== activeRelayEntry) return;
-          if (!payload || payload.length < 3) return;
+          if (entry !== activeRelayEntry || !payload || payload.length < 3) return;
 
-          const fmt = payload[0];
-          const seq = payload[1];
-          // Immediately ACK so teacher's flow controller knows the frame arrived
-          client.publish(toHostTopic, JSON.stringify({ type: 'ack', seq }), { qos: 0 });
+          const type = payload[0];
+          const gen = payload[1];
 
-          if (fmt === 1 || fmt === 2) {
-            const blob = new Blob([payload.subarray(2)], { type: fmt === 1 ? 'image/webp' : 'image/jpeg' });
+          if (type === 4) {
+            // MSE stream start metadata
+            try {
+              const meta = JSON.parse(decodePayload(payload.subarray(2)));
+              initBoardMse(gen, meta.mime, !!meta.audio);
+            } catch (e) { requestImgFallback(); }
+          } else if (type === 3) {
+            // Live compressed video chunk
+            if (gen !== activeMseGen) return;
+            mseQueue.push(payload.slice(2));
+            drainMseQueue();
+          } else if (type === 1 || type === 2) {
+            // Fallback WebP/JPEG frame
+            const blob = new Blob([payload.subarray(2)], { type: type === 1 ? 'image/webp' : 'image/jpeg' });
             renderBoardFrame(blob);
           }
         }
